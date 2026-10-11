@@ -309,6 +309,8 @@ int main() {
     Pass ssaoBlurPass  = pass_create("shaders/fullscreen.vert", "shaders/ssao_blur.frag");
     Pass ssgiPass      = pass_create("shaders/fullscreen.vert", "shaders/ssgi.frag");
     Pass taaPass       = pass_create("shaders/fullscreen.vert", "shaders/taa.frag");
+    Pass fogRaymarchPass = pass_create("shaders/fullscreen.vert", "shaders/fog_raymarch.frag");
+    Pass fogCompositePass = pass_create("shaders/fullscreen.vert", "shaders/fog_composite.frag");
     Pass octaCapturePass = pass_create("shaders/fullscreen.vert", "shaders/octa_capture.frag");
     Pass shProjectPass   = pass_create("shaders/fullscreen.vert", "shaders/sh_project.frag");
 
@@ -327,6 +329,8 @@ int main() {
     Framebuffer octaCaptureFB = fb_create(128, 128, FB_RGBA16F);
     Framebuffer shFB         = fb_create(9, 1, FB_RGBA32F);
     Framebuffer sceneFB;   // HDR lit scene with a depth texture
+    Framebuffer fogFB;             // half-res fog (rgba=scatter, a=transmit)
+    Framebuffer fogCompositeFB;    // full-res composited scene
     Framebuffer taaHistory[2];   // ping-pong
     int taaPing = 0;
     int frameIndex = 0;
@@ -346,6 +350,8 @@ int main() {
     fb_destroy(&shFB);
     if (ssaoFB.fbo)  fb_destroy(&ssaoFB);
     if (ssgiFB.fbo)  fb_destroy(&ssgiFB);
+    if (fogFB.fbo)   fb_destroy(&fogFB);
+    if (fogCompositeFB.fbo) fb_destroy(&fogCompositeFB);
     if (ssaoBlurFB.fbo) fb_destroy(&ssaoBlurFB);
         sceneFB     = fb_create_with_depth_tex(w, h, FB_RGBA16F);
         gbuf        = fb_create_gbuffer(w, h, sceneFB.depth);
@@ -639,6 +645,71 @@ int main() {
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
         }
 
+        // ---------- Volumetric fog ----------
+        // Half-res raymarch, full-res composite. Runs after geometry so
+        // it reads this frame's depth, and before TAA so the temporal
+        // filter smooths out the raymarch noise.
+        {
+            glm::mat4 invVP = glm::inverse(viewProj);
+
+            fb_bind(&fogFB);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
+            glClearColor(0,0,0,1);
+            glClear(GL_COLOR_BUFFER_BIT);
+            pass_use(&fogRaymarchPass);
+
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, sceneFB.depth);
+            pass_set_i32(&fogRaymarchPass, "uSceneDepth", 0);
+
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D_ARRAY, shadow.depthTex);
+            pass_set_i32(&fogRaymarchPass, "uShadowMap", 1);
+
+            for (int i = 0; i < CSM_CASCADE_COUNT; ++i) {
+                char n[32];
+                std::snprintf(n, 32, "uLightSpace[%d]", i);
+                pass_set_mat4(&fogRaymarchPass, n, shadow.lightSpace[i]);
+                std::snprintf(n, 32, "uCascadeSplits[%d]", i);
+                pass_set_f32(&fogRaymarchPass, n, shadow.splits[i]);
+            }
+            pass_set_f32(&fogRaymarchPass, "uShadowTexel", 1.0f / (float)shadow.size);
+
+            pass_set_mat4(&fogRaymarchPass, "uInvViewProj", invVP);
+            pass_set_vec3(&fogRaymarchPass, "uCamPos", cam.pos);
+            pass_set_vec3(&fogRaymarchPass, "uLightDir", lightDir);
+            pass_set_vec3(&fogRaymarchPass, "uLightColor", lightColor);
+            pass_set_f32 (&fogRaymarchPass, "uLightIntensity", lightIntensity);
+            pass_set_vec2(&fogRaymarchPass, "uFullResolution", glm::vec2(fbw, fbh));
+            pass_set_vec2(&fogRaymarchPass, "uHalfResolution", glm::vec2(fbw/2, fbh/2));
+
+            // Fog tuning — these are the knobs
+            pass_set_f32(&fogRaymarchPass, "uFogDensity",     0.015f);
+            pass_set_f32(&fogRaymarchPass, "uFogHeightFall",  0.20f);
+            pass_set_f32(&fogRaymarchPass, "uFogMaxDist",     80.0f);
+            pass_set_f32(&fogRaymarchPass, "uFogSteps",       32.0f);
+            pass_set_f32(&fogRaymarchPass, "uSunScatter",     1.5f);
+            pass_set_f32(&fogRaymarchPass, "uAmbientScatter", 1.5f);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+
+            // Composite fog over scene
+            fb_bind(&fogCompositeFB);
+            glClear(GL_COLOR_BUFFER_BIT);
+            pass_use(&fogCompositePass);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, gbuf.color);
+            pass_set_i32(&fogCompositePass, "uSceneColor", 0);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, fogFB.color);
+            pass_set_i32(&fogCompositePass, "uFogTexture", 1);
+            pass_set_vec2(&fogCompositePass, "uInvResolution", glm::vec2(1.f/fbw, 1.f/fbh));
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+
+            glEnable(GL_DEPTH_TEST);
+            glEnable(GL_CULL_FACE);
+        }
+
         // ---------- TAA resolve ----------
         int curr = taaPing;
         int prev = 1 - taaPing;
@@ -706,6 +777,8 @@ int main() {
     fb_destroy(&shFB);
     if (ssaoFB.fbo)  fb_destroy(&ssaoFB);
     if (ssgiFB.fbo)  fb_destroy(&ssgiFB);
+    if (fogFB.fbo)   fb_destroy(&fogFB);
+    if (fogCompositeFB.fbo) fb_destroy(&fogCompositeFB);
     if (ssaoBlurFB.fbo) fb_destroy(&ssaoBlurFB);
     if (sceneFB.fbo) fb_destroy(&sceneFB);
     pass_destroy(&tonemapPass);
