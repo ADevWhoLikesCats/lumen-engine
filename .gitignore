@@ -1,0 +1,30 @@
+# Build artifacts
+*.o
+*.d
+*.a
+*.so
+*.so.*
+lumen
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Local backups from the debugging session
+*.bak
+*.broken
+*.mangled
+src/main.cpp.bak
+
+# Misc
+core
+core.*
+vgcore.*
+*.log
