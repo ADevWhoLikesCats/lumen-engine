@@ -17,7 +17,7 @@ ifeq ($(OS),Windows_NT)
 endif
 
 # -------- sources --------
-SRC    := src/main.cpp src/glad.c src/collision.cpp src/texture.cpp src/map.cpp src/glb_loader.cpp
+SRC    := src/main.cpp src/glad.c src/collision.cpp src/texture.cpp src/map.cpp src/glb_loader.cpp src/pass.cpp src/framebuffer.cpp src/asset.cpp src/mesh.cpp
 OBJ    := $(SRC:.cpp=.o)
 OBJ    := $(OBJ:.c=.o)
 

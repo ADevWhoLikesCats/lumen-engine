@@ -1,6 +1,7 @@
 // ---------------------------------------------------------------
-// Minimal forward-rendered FPS engine with Lambert lighting.
-// OpenGL 3.3 core. GLFW for window/input, GLM for math, GLAD for loader.
+// lumen-engine — deferred G-buffer pipeline (Phase 1)
+// Geometry pass writes to a 4-attachment G-buffer.
+// The result is tonemapped to the backbuffer.
 // ---------------------------------------------------------------
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -8,28 +9,29 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
-#include "collider.h"
-#include "controller.h"
+#include "pass.h"
+#include "framebuffer.h"
 #include "mesh.h"
 #include "instanced.h"
 #include "shadowmap.h"
 #include "texture.h"
 #include "map.h"
+#include "collider.h"
+#include "controller.h"
+
 #include <vector>
 #include <unordered_map>
-#include <algorithm>
 #include <random>
-
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
-#include <vector>
 #include <fstream>
 #include <sstream>
 #include <iostream>
 
 // ===============================================================
-// Shader helper
+// Shader helper — reads source and compiles through Pass
 // ===============================================================
 static std::string readFile(const char* path) {
     std::ifstream f(path);
@@ -52,24 +54,14 @@ static GLuint compile(GLenum type, const std::string& src) {
     return s;
 }
 
+// Simple uniform-cached shader (for the geometry pass — separate from Pass).
 struct Shader {
     GLuint id = 0;
     mutable std::unordered_map<std::string, GLint> cache;
 
-    // Look up once, cache forever.
-    GLint loc(const char* n) const {
-        auto it = cache.find(n);
-        if (it != cache.end()) return it->second;
-        GLint l = glGetUniformLocation(id, n);
-        cache.emplace(n, l);
-        return l;
-    }
-
     Shader(const char* vsPath, const char* fsPath) {
-        std::string vsrc = readFile(vsPath);
-        GLuint vs = compile(GL_VERTEX_SHADER, vsrc);
-        std::string fsrc = readFile(fsPath);
-        GLuint fs = compile(GL_FRAGMENT_SHADER, fsrc);
+        GLuint vs = compile(GL_VERTEX_SHADER,   readFile(vsPath));
+        GLuint fs = compile(GL_FRAGMENT_SHADER, readFile(fsPath));
         id = glCreateProgram();
         glAttachShader(id, vs); glAttachShader(id, fs);
         glLinkProgram(id);
@@ -82,91 +74,23 @@ struct Shader {
     }
     void use() const { glUseProgram(id); }
 
-    void set(const char* n, float v)              const { glUniform1f(loc(n), v); }
-    void set(const char* n, int v)                const { glUniform1i(loc(n), v); }
-    void set(const char* n, const glm::vec2& v)   const { glUniform2fv(loc(n),1,glm::value_ptr(v)); }
-    void set(const char* n, const glm::vec3& v)   const { glUniform3fv(loc(n),1,glm::value_ptr(v)); }
-    void set(const char* n, const glm::mat3& m)   const { glUniformMatrix3fv(loc(n),1,GL_FALSE,glm::value_ptr(m)); }
-    void set(const char* n, const glm::mat4& m)   const { glUniformMatrix4fv(loc(n),1,GL_FALSE,glm::value_ptr(m)); }
+    GLint loc(const char* n) const {
+        auto it = cache.find(n);
+        if (it != cache.end()) return it->second;
+        GLint l = glGetUniformLocation(id, n);
+        cache.emplace(n, l);
+        return l;
+    }
+    void set(const char* n, float v)            const { glUniform1f(loc(n), v); }
+    void set(const char* n, int v)              const { glUniform1i(loc(n), v); }
+    void set(const char* n, const glm::vec2& v) const { glUniform2fv(loc(n),1,glm::value_ptr(v)); }
+    void set(const char* n, const glm::vec3& v) const { glUniform3fv(loc(n),1,glm::value_ptr(v)); }
+    void set(const char* n, const glm::mat3& m) const { glUniformMatrix3fv(loc(n),1,GL_FALSE,glm::value_ptr(m)); }
+    void set(const char* n, const glm::mat4& m) const { glUniformMatrix4fv(loc(n),1,GL_FALSE,glm::value_ptr(m)); }
 };
 
 // ===============================================================
-// Mesh: position(3) normal(3) uv(2)
-// ===============================================================
-// --- Primitive builders ---------------------------------------
-
-static Mesh makeCube() {
-    Vertex v[24];
-    glm::vec3 n[6] = {{ 0,0, 1},{ 0,0,-1},{ 1,0,0},{-1,0,0},{ 0,1,0},{ 0,-1,0}};
-    glm::vec2 uvs[4] = {{0,0},{1,0},{1,1},{0,1}};
-    int vi = 0;
-    for (int f = 0; f < 6; ++f) {
-        glm::vec3 a = n[f];
-        glm::vec3 t = (fabsf(a.y) > 0.5f) ? glm::vec3(1,0,0) : glm::vec3(0,1,0);
-        glm::vec3 b = glm::cross(a, t);
-        glm::vec3 c = glm::cross(a, b);
-        // corner order: (-,-), (+,-), (+,+), (-,+)
-        glm::vec3 p[4] = { -b-c, b-c, b+c, -b+c };
-        for (int i = 0; i < 4; ++i) {
-            v[vi++] = { p[i]*0.5f + a*0.5f, a, uvs[i] };
-        }
-    }
-    std::vector<Vertex> verts(v, v+24);
-    std::vector<uint32_t> idx;
-    for (int f = 0; f < 6; ++f) {
-        uint32_t o = f*4;
-        idx.insert(idx.end(), {o,o+1,o+2, o,o+2,o+3});
-    }
-    return Mesh(verts, idx);
-}
-
-static Mesh makePlane(float size) {
-    float h = size * 0.5f;
-    std::vector<Vertex> v = {
-        {{-h,0,-h},{0,1,0},{0,0}},
-        {{ h,0,-h},{0,1,0},{1,0}},
-        {{ h,0, h},{0,1,0},{1,1}},
-        {{-h,0, h},{0,1,0},{0,1}},
-    };
-    std::vector<uint32_t> i = {0,2,1, 0,3,2};
-    return Mesh(v, i);
-}
-
-// ===============================================================
-// Camera (FPS)
-// ===============================================================
-struct Camera {
-    glm::vec3 pos{0, 1.7f, 5};
-    float yaw = -90.f, pitch = 0.f;
-    float speed = 4.5f, sens = 0.12f;
-
-    glm::vec3 forward() const {
-        float cy = cosf(glm::radians(yaw));
-        float sy = sinf(glm::radians(yaw));
-        float cp = cosf(glm::radians(pitch));
-        float sp = sinf(glm::radians(pitch));
-        return glm::normalize(glm::vec3(cy*cp, sp, sy*cp));
-    }
-    glm::vec3 right() const { return glm::normalize(glm::cross(forward(), {0,1,0})); }
-
-    void mouse(float dx, float dy) {
-        yaw   += dx * sens;
-        pitch  = glm::clamp(pitch - dy * sens, -89.f, 89.f);
-    }
-    void move(float dt, bool w, bool s, bool a, bool d) {
-        glm::vec3 dir{0};
-        if (w) dir += forward();
-        if (s) dir -= forward();
-        if (d) dir += right();
-        if (a) dir -= right();
-        dir.y = 0;                       // walking, not flying
-        if (glm::length(dir) > 0.0001f) pos += glm::normalize(dir) * speed * dt;
-    }
-    glm::mat4 view() const { return glm::lookAt(pos, pos + forward(), {0,1,0}); }
-};
-
-// ===============================================================
-// Input state
+// Input
 // ===============================================================
 struct Input {
     bool firstMouse = true;
@@ -175,11 +99,11 @@ struct Input {
     bool w = false, a = false, s = false, d = false;
     bool shift = false;
 };
-
 static Input gInput;
 
 static void key_cb(GLFWwindow*, int key, int, int action, int) {
-    if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) glfwSetWindowShouldClose(glfwGetCurrentContext(), true);
+    if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
+        glfwSetWindowShouldClose(glfwGetCurrentContext(), true);
     bool down = (action != GLFW_RELEASE);
     if (key == GLFW_KEY_W) gInput.w = down;
     if (key == GLFW_KEY_A) gInput.a = down;
@@ -196,21 +120,43 @@ static void mouse_cb(GLFWwindow*, double x, double y) {
 }
 
 // ===============================================================
+// Camera
+// ===============================================================
+struct Camera {
+    glm::vec3 pos{0, 1.7f, 5};
+    float yaw = -90.f, pitch = -30.f;
+    float speed = 4.5f, sens = 0.12f;
+
+    glm::vec3 forward() const {
+        float cy = cosf(glm::radians(yaw));
+        float sy = sinf(glm::radians(yaw));
+        float cp = cosf(glm::radians(pitch));
+        float sp = sinf(glm::radians(pitch));
+        return glm::normalize(glm::vec3(cy*cp, sp, sy*cp));
+    }
+    glm::vec3 right() const { return glm::normalize(glm::cross(forward(), {0,1,0})); }
+    void mouse(float dx, float dy) {
+        yaw += dx * sens;
+        pitch = glm::clamp(pitch - dy * sens, -89.f, 89.f);
+    }
+    glm::mat4 view() const { return glm::lookAt(pos, pos + forward(), {0,1,0}); }
+};
+
+// ===============================================================
 // main
 // ===============================================================
 int main() {
     if (!glfwInit()) { std::cerr << "glfwInit failed\n"; return 1; }
 
-    glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 #ifdef __APPLE__
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
-    // glfwWindowHint(GLFW_SAMPLES, 4);
+    glfwWindowHint(GLFW_SAMPLES, 0);   // deferred: MSAA off, TAA comes later
 
-    GLFWwindow* win = glfwCreateWindow(1280, 720, "Lambert FPS", nullptr, nullptr);
+    GLFWwindow* win = glfwCreateWindow(1280, 720, "lumen-engine", nullptr, nullptr);
     if (!win) { std::cerr << "Window creation failed\n"; return 1; }
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
@@ -225,143 +171,92 @@ int main() {
 
     std::cout << "GL " << glGetString(GL_VERSION) << "\n";
 
-    // Render state
     glEnable(GL_DEPTH_TEST);
-    // glEnable(GL_MULTISAMPLE);
-glEnable(GL_CULL_FACE);
+    glEnable(GL_CULL_FACE);
     glCullFace(GL_BACK);
     glFrontFace(GL_CCW);
 
-    // Resources
-    Shader lambert("shaders/lambert.vert", "shaders/lambert.frag");
+    // ---------- Assets ----------
+    Texture floorTex("assets/ground.png");
+    Texture crateTex("assets/crate.png");
+
+    // Geometry: cube + plane
     Mesh cube  = makeCube();
     Mesh floor = makePlane(1.f);
 
-    Camera cam;
-    CharacterController player;
-    player.height  = 1.7f;
-    player.radius  = 0.3f;
-    float vy = 0.f;
-
-    glm::vec3 lightDir = glm::normalize(glm::vec3(-0.4f, -1.0f, -0.3f));
-
-    // Scene: list of (mesh, model, color)
-    struct Instance { const Mesh* mesh; glm::mat4 model; glm::vec3 color; const Texture* tex = nullptr; glm::vec2 uvScale{1,1}; float material = 0.f; };
-    std::vector<Instance> scene;
-    auto add = [&](const Mesh& m, glm::mat4 xf, glm::vec3 c, const Texture* t = nullptr,
-                   glm::vec2 uvs = {1,1}, float mat = 0.f) {
-        scene.push_back({&m, xf, c, t, uvs, mat});
-    };
+    // ---------- Map ----------
+    GeneratedMap map = generateMap(24, 24, 4.0f, 1337u);
 
     std::vector<OBB> world;
-
-    // ---- Generated map ----
-    GeneratedMap map = generateMap(24, 24, 4.0f, /*seed=*/1337u);
-
-    // Floor: one big quad, tiled via uUVScale.
-    float floorTiles = (float)map.W;   // one tile per world cell
-    Texture floorTex("assets/ground.png");
-    Texture crateTex("assets/crate.png");
-    add(floor,
-        glm::translate(glm::mat4(1.f), glm::vec3(map.W*map.tile*0.5f, 0.f, map.H*map.tile*0.5f))
-      * glm::scale(glm::mat4(1.f), glm::vec3(map.W*map.tile, 1.f, map.H*map.tile)),
-        {1,1,1}, &floorTex, glm::vec2(floorTiles, floorTiles));
-
-    // Floor collider (thin slab).
     {
         // Center the slab under the visual floor mesh, which sits at
-        // (W*tile/2, 0, H*tile/2). Same translate as the mesh, minus half
-        // the slab thickness so the top face is at y = 0.
+        // (W*tile/2, 0, H*tile/2). Same center as the floor's visual transform.
         glm::vec3 ctr(map.W*map.tile*0.5f, -0.5f, map.H*map.tile*0.5f);
         glm::mat4 fm = glm::translate(glm::mat4(1.f), ctr)
-                     * glm::scale(glm::mat4(1.f),
-                                  glm::vec3(map.W*map.tile, 1.f, map.H*map.tile));
+                     * glm::scale(glm::mat4(1.f), glm::vec3(map.W*map.tile, 1.f, map.H*map.tile));
         world.push_back(OBB::fromMatrix(fm, glm::vec3(0.5f)));
     }
 
-    // Walls — instanced from the generator.
+    // Scene: an Instance is mesh + transform + color + material flag
+    struct Instance {
+        const Mesh* mesh;
+        glm::mat4   model;
+        glm::vec3   color;
+        const Texture* tex;
+        glm::vec2   uvScale;
+        float       material;
+    };
+    std::vector<Instance> scene;
+
+    auto add = [&](const Mesh& m, glm::mat4 xf, glm::vec3 c,
+                   const Texture* t = nullptr, glm::vec2 uvs = {1,1}, float mat = 0.f) {
+        scene.push_back({&m, xf, c, t, uvs, mat});
+    };
+
+    // Floor (textured, big quad)
+    float floorTiles = (float)map.W * 2.0f;
+    add(floor,
+        glm::translate(glm::mat4(1.f), glm::vec3(map.W*map.tile*0.5f, 0.f, map.H*map.tile*0.5f))
+      * glm::scale(glm::mat4(1.f), glm::vec3(map.W*map.tile, 1.f, map.H*map.tile)),
+        {1,1,1}, &floorTex, glm::vec2(floorTiles, floorTiles), 2.0f);
+
+    // Walls
     for (size_t i = 0; i < map.wallTransforms.size(); ++i) {
         add(cube, map.wallTransforms[i], {0.55f, 0.53f, 0.50f});
         world.push_back(map.wallColliders[i]);
     }
 
-    // PROPS-BLOCK: scatter small objects across walkable cells.
+    // Props
     {
-        std::mt19937 propRng(1337u ^ 0x9E3779B9u);   // deterministic per seed
+        std::mt19937 rng(1337u ^ 0x9E3779B9u);
         std::uniform_real_distribution<float> chance(0.f, 1.f);
         std::uniform_int_distribution<int>   kind(0, 2);
         std::uniform_real_distribution<float> jitter(-0.15f, 0.15f);
-
-        int placed = 0;
         for (int y = 0; y < map.H; ++y) {
             for (int x = 0; x < map.W; ++x) {
                 if (!map.walkable(x, y)) continue;
-                if (chance(propRng) > 0.15f) continue;   // ~15% of open cells
-
+                if (chance(rng) > 0.15f) continue;
                 glm::vec3 c = map.cellCenter(x, y);
-                // Skip the spawn cell so the player doesn't start inside a crate.
                 if (glm::distance(c, map.spawn) < 2.0f) continue;
+                c.x += jitter(rng);
+                c.z += jitter(rng);
 
-                // Jitter a bit so props don't sit perfectly on the grid.
-                c.x += jitter(propRng);
-                c.z += jitter(propRng);
-
-                glm::vec3 half, color;
-                float mat = 0.f;
-                switch (kind(propRng)) {
-                    case 0:  // crate
-                        half  = {0.35f, 0.35f, 0.35f};
-                        color = {0.62f, 0.42f, 0.24f};
-                        mat   = 1.f;   // use crate texture
-                        break;
-                    case 1:  // pillar
-                        half  = {0.25f, 1.00f, 0.25f};
-                        color = {0.55f, 0.52f, 0.48f};   // grey stone
-                        break;
-                    default: // barrel
-                        half  = {0.35f, 0.50f, 0.35f};
-                        color = {0.32f, 0.38f, 0.42f};   // blue-grey metal
-                        break;
+                glm::vec3 half, color; float mat = 0.f;
+                switch (kind(rng)) {
+                    case 0: half={0.35f,0.35f,0.35f}; color={0.62f,0.42f,0.24f}; mat=1.f; break;
+                    case 1: half={0.25f,1.00f,0.25f}; color={0.55f,0.52f,0.48f}; break;
+                    default: half={0.35f,0.50f,0.35f}; color={0.32f,0.38f,0.42f}; break;
                 }
-
-                glm::vec3 pos = c + glm::vec3(0, half.y, 0);   // sit on floor
+                glm::vec3 pos = c + glm::vec3(0, half.y, 0);
                 glm::mat4 m = glm::translate(glm::mat4(1.f), pos)
                             * glm::scale(glm::mat4(1.f), half * 2.f);
-                add(cube, m, color, nullptr, glm::vec2(1,1), mat);
-
-                // Collider: unit-cube OBB, scaled to the same half-extents.
+                add(cube, m, color, nullptr, {1,1}, mat);
                 world.push_back(OBB::fromMatrix(m, glm::vec3(0.5f)));
-                ++placed;
             }
         }
-        std::cerr << "PROPS: placed " << placed << " objects\n";
     }
 
-    // Move player spawn to a guaranteed-open cell.
-    player.pos = map.spawn;
-
-    auto box = [&](glm::vec3 p, glm::vec3 size, glm::vec3 color) {
-        glm::mat4 m = glm::translate(glm::mat4(1.f), p) * glm::scale(glm::mat4(1.f), size);
-        add(cube, m, color);
-        world.push_back(OBB::fromMatrix(m, glm::vec3(0.5f)));
-    };
-    box({ 0, 0.5f,  0}, {1,1,1},   {0.85f, 0.32f, 0.28f});
-    box({ 3, 0.75f,-2}, {1.5f,1.5f,1.5f}, {0.30f, 0.62f, 0.85f});
-    box({-3, 1.0f, -3}, {2,2,2},   {0.75f, 0.75f, 0.35f});
-    box({-1, 0.3f,  4}, {0.6f,0.6f,3.f}, {0.4f, 0.7f, 0.4f});
-    box({ 5, 0.25f, 3}, {2.f,0.5f,2.f},  {0.6f, 0.4f, 0.7f});
-
-    {
-        glm::mat4 m = glm::translate(glm::mat4(1.f), glm::vec3(-4.f, 0.8f, 2.f))
-                    * glm::rotate(glm::mat4(1.f), glm::radians(28.f), glm::vec3(0,0,1))
-                    * glm::scale(glm::mat4(1.f), glm::vec3(3.f, 0.4f, 2.f));
-        add(cube, m, {0.5f, 0.5f, 0.55f});
-        world.push_back(OBB::fromMatrix(m, glm::vec3(0.5f)));
-    }
-
-    float last = (float)glfwGetTime();
-
-    // INSTANCED-SETUP: gather every cube-drawn instance into one buffer.
+    // Split cube instances from non-cube instances
     std::vector<glm::mat4> cubeModels;
     std::vector<glm::vec3> cubeColors;
     std::vector<float>     cubeMaterials;
@@ -372,39 +267,58 @@ glEnable(GL_CULL_FACE);
             cubeMaterials.push_back(inst.material);
         }
     }
-    std::cerr << "INSTANCED: " << cubeModels.size() << " cube instances\n";
+    scene.erase(std::remove_if(scene.begin(), scene.end(),
+        [&](const Instance& i){ return i.mesh == &cube; }), scene.end());
 
     InstancedMesh instancedCube;
     instancedCube.init(cube, cubeModels.size() + 16);
 
-    Shader instShader("shaders/lambert_instanced.vert",
-                      "shaders/lambert_instanced.frag");
-
-    // Remove cube instances from the per-frame list; they'll draw instanced.
-    scene.erase(std::remove_if(scene.begin(), scene.end(),
-        [&](const Instance& i){ return i.mesh == &cube; }), scene.end());
-
-    // SHADOW-SETUP
+    // ---------- Shadow map ----------
     ShadowMap shadow;
-    shadow.init(60.0f);
-    Shader depthInstShader ("shaders/depth_instanced.vert", "shaders/depth.frag");
-    Shader depthModelShader("shaders/depth_model.vert",     "shaders/depth.frag");
+    shadow.init();
 
-    // SKY-SETUP
-    Shader skyShader("shaders/sky.vert", "shaders/sky.frag");
-    GLuint skyVAO = 0;
-    glGenVertexArrays(1, &skyVAO);   // empty VAO, needed for core profile
+    Shader depthInstShader ("shaders/depth_csm_inst.vert",  "shaders/depth.frag");
+    Shader depthModelShader("shaders/depth_csm_model.vert", "shaders/depth.frag");
 
-    // Sky/fog colors (linear, before gamma).
-    glm::vec3 skyHorizon(0.65f, 0.75f, 0.90f);
-    glm::vec3 skyZenith (0.15f, 0.35f, 0.75f);
-    float     fogDensity = 0.012f;
+    // ---------- PBR geometry pass shaders ----------
+    Shader pbrInstShader ("shaders/pbr_inst.vert",  "shaders/pbr.frag");
+    Shader pbrModelShader("shaders/pbr_model.vert", "shaders/pbr.frag");
 
+    // ---------- Tonemap pass ----------
+    Pass tonemapPass = pass_create("shaders/tonemap.vert", "shaders/tonemap.frag");
+
+    // ---------- Per-frame state ----------
+    Camera cam;
+    CharacterController player;
+    player.pos = map.spawn;
+    player.height = 1.7f;
+    player.radius = 0.3f;
+    float vy = 0.f;
+
+    glm::vec3 lightDir = glm::normalize(glm::vec3(-0.4f, -1.0f, -0.3f));
+    glm::vec3 lightColor(1.0f, 0.96f, 0.90f);
+    float     lightIntensity = 1.8f;
+
+    Framebuffer sceneFB;   // HDR lit scene with a depth texture
+    Framebuffer gbuf;      // G-buffer (4 MRT attachments, borrowed depth)
+    int lastW = 0, lastH = 0;
+
+    auto ensureFB = [&](int w, int h) {
+        if (w == lastW && h == lastH) return;
+        lastW = w; lastH = h;
+        if (sceneFB.fbo) fb_destroy(&sceneFB);
+        if (gbuf.fbo)    fb_destroy(&gbuf);
+        sceneFB = fb_create_with_depth_tex(w, h, FB_RGBA16F);
+        gbuf    = fb_create_gbuffer(w, h, sceneFB.depth);
+    };
+
+    float lastTime = (float)glfwGetTime();
     while (!glfwWindowShouldClose(win)) {
         float now = (float)glfwGetTime();
-        float dt = now - last; last = now;
+        float dt = now - lastTime; lastTime = now;
+        if (dt > 0.1f) dt = 0.1f;   // clamp big hitches
 
-        // --- input ---
+        // ---------- Input ----------
         cam.mouse(gInput.dx, gInput.dy);
         gInput.dx = gInput.dy = 0;
 
@@ -414,143 +328,143 @@ glEnable(GL_CULL_FACE);
         if (gInput.d) wish += cam.right();
         if (gInput.a) wish -= cam.right();
         wish.y = 0.f;
-        if (glm::dot(wish,wish) > 1e-6f) wish = glm::normalize(wish) * cam.speed;
-
+        if (glm::dot(wish, wish) > 1e-6f) {
+            float spd = cam.speed * (gInput.shift ? 2.5f : 1.0f);
+            wish = glm::normalize(wish) * spd;
+        }
         vy -= 20.f * dt;
         if (vy < -30.f) vy = -30.f;
         wish.y = vy;
-
         player.move(wish * dt, world);
         if (player.grounded && vy < 0.f) vy = 0.f;
-
         cam.pos = player.eye();
 
-        // --- render ---
-        int fbw, fbh; glfwGetFramebufferSize(win, &fbw, &fbh);
-        glViewport(0, 0, fbw, fbh);
-        glClearColor(0.65f, 0.75f, 0.90f, 1.f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        // ---------- Window size ----------
+        int fbw, fbh;
+        glfwGetFramebufferSize(win, &fbw, &fbh);
+        if (fbw <= 0 || fbh <= 0) { glfwPollEvents(); continue; }
+        ensureFB(fbw, fbh);
 
-        float aspect = fbw > 0 ? (float)fbw / (float)fbh : 1.f;
+        float aspect = (float)fbw / (float)fbh;
         glm::mat4 proj = glm::perspective(glm::radians(70.f), aspect, 0.1f, 200.f);
+        glm::mat4 view = cam.view();
+        glm::mat4 viewProj = proj * view;
 
-        // SHADOW-PASS: render depth from the light's POV.
-        shadow.bindForWriting();
-        {
+        // ---------- Shadow pass (one per cascade) ----------
+        shadow.update(view, proj, lightDir, aspect,
+                      glm::radians(70.f), 0.1f);
+        for (int c = 0; c < CSM_CASCADE_COUNT; ++c) {
+            shadow.bindForWriting(c);
             depthInstShader.use();
-            depthInstShader.set("uLightSpace", shadow.matrix());
+            depthInstShader.set("uLightSpace", shadow.lightSpace[c]);
             instancedCube.draw();
 
             depthModelShader.use();
-            depthModelShader.set("uLightSpace", shadow.matrix());
+            depthModelShader.set("uLightSpace", shadow.lightSpace[c]);
             for (auto& inst : scene) {
                 depthModelShader.set("uModel", inst.model);
                 inst.mesh->draw();
             }
         }
         shadow.unbindForWriting();
-        glViewport(0, 0, fbw, fbh);
+
+        // ---------- Geometry pass -> G-buffer ----------
+        fb_bind(&gbuf);
+        {
+            GLenum bufs[4] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1,
+                               GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3 };
+            glDrawBuffers(4, bufs);
+        }
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+        glClearColor(0.f, 0.f, 0.f, 1.f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        // SKY-DRAW: full-screen triangle at the far plane.
-        {
-            glDepthMask(GL_FALSE);          // don't write depth
-            glDisable(GL_CULL_FACE);        // triangle winds either way
-            skyShader.use();
-            glm::mat4 invVP = glm::inverse(proj * cam.view());
-            skyShader.set("uInvViewProj",  invVP);
-            skyShader.set("uHorizonColor", skyHorizon);
-            skyShader.set("uZenithColor",  skyZenith);
-            skyShader.set("uCameraPos",    cam.pos);
-            glBindVertexArray(skyVAO);
-            glDrawArrays(GL_TRIANGLES, 0, 3);
-            glBindVertexArray(0);
-            glEnable(GL_CULL_FACE);
-            glDepthMask(GL_TRUE);
+        // Instanced cubes
+        pbrInstShader.use();
+        pbrInstShader.set("uViewProj",    viewProj);
+        pbrInstShader.set("uView",        view);
+        for (int i = 0; i < CSM_CASCADE_COUNT; ++i) {
+            char n[32]; std::snprintf(n, 32, "uLightSpace[%d]", i);
+            pbrInstShader.set(n, shadow.lightSpace[i]);
         }
-
-        lambert.use();
-        lambert.set("uLightSpace",  shadow.matrix());
-        lambert.set("uShadowMap",   1);
-        lambert.set("uShadowTexel", 1.0f / (float)shadow.size);
-        lambert.set("uFogHorizon", skyHorizon);
-        lambert.set("uFogZenith",  skyZenith);
-        lambert.set("uFogDensity", fogDensity);
+        pbrInstShader.set("uCascadeSplits[0]", shadow.splits[0]);
+        pbrInstShader.set("uCascadeSplits[1]", shadow.splits[1]);
+        pbrInstShader.set("uCascadeSplits[2]", shadow.splits[2]);
+        pbrInstShader.set("uCamPos",      cam.pos);
+        pbrInstShader.set("uLightDir",    lightDir);
+        pbrInstShader.set("uLightColor",  lightColor);
+        pbrInstShader.set("uLightIntensity", lightIntensity);
+        pbrInstShader.set("uShadowMap",   1);
+        pbrInstShader.set("uShadowTexel", 1.0f / (float)shadow.size);
+        pbrInstShader.set("uShadowEnabled", 1);
+        pbrInstShader.set("uCrateTex",    2);
         shadow.bindForReading(1);
-        lambert.set("uView",       cam.view());
-        lambert.set("uProj",       proj);
-        lambert.set("uCameraPos",  cam.pos);
-        lambert.set("uLightDir",   lightDir);
-        lambert.set("uLightColor", glm::vec3(1.0f, 0.96f, 0.90f));
-        lambert.set("uAmbient",    glm::vec3(0.15f, 0.16f, 0.20f));
-        lambert.set("uUseTexture", 0);
+        if (crateTex.id) crateTex.bind(2);
+        instancedCube.upload(cubeModels, cubeColors, cubeMaterials);
+        instancedCube.draw();
 
-        { static int once = 0; if (once++ < 1) {
-            std::cerr << "FLOOR-DIAG: scene[0].model[3] = "
-                      << scene[0].model[3][0] << ","
-                      << scene[0].model[3][1] << ","
-                      << scene[0].model[3][2] << "\n";
-            std::cerr << "FLOOR-DIAG: cam.pos = "
-                      << cam.pos.x << "," << cam.pos.y << "," << cam.pos.z << "\n";
-            std::cerr << "FLOOR-DIAG: cam.forward = "
-                      << cam.forward().x << "," << cam.forward().y << "," << cam.forward().z << "\n";
-          } }
+        // Non-instanced geometry (floor, GLB)
+        pbrModelShader.use();
+        pbrModelShader.set("uViewProj",    viewProj);
+        pbrModelShader.set("uView",        view);
+        for (int i = 0; i < CSM_CASCADE_COUNT; ++i) {
+            char n[32]; std::snprintf(n, 32, "uLightSpace[%d]", i);
+            pbrModelShader.set(n, shadow.lightSpace[i]);
+        }
+        pbrModelShader.set("uCascadeSplits[0]", shadow.splits[0]);
+        pbrModelShader.set("uCascadeSplits[1]", shadow.splits[1]);
+        pbrModelShader.set("uCascadeSplits[2]", shadow.splits[2]);
+        pbrModelShader.set("uCamPos",      cam.pos);
+        pbrModelShader.set("uLightDir",    lightDir);
+        pbrModelShader.set("uLightColor",  lightColor);
+        pbrModelShader.set("uLightIntensity", lightIntensity);
+        pbrModelShader.set("uShadowMap",   1);
+        pbrModelShader.set("uShadowTexel", 1.0f / (float)shadow.size);
+        pbrModelShader.set("uShadowEnabled", 1);
+        pbrModelShader.set("uCrateTex",    2);
+        pbrModelShader.set("uGroundTex",   3);
+        if (floorTex.id) floorTex.bind(3);
+        shadow.bindForReading(1);
+        if (crateTex.id) crateTex.bind(2);
         for (auto& inst : scene) {
-            lambert.set("uModel", inst.model);
-            lambert.set("uNormalMat", glm::mat3(glm::transpose(glm::inverse(inst.model))));
-            lambert.set("uBaseColor", inst.color);
-            lambert.set("uUVScale",   inst.uvScale);
-            if (inst.tex && inst.tex->id) {
-                lambert.set("uUseTexture", 1);
-                lambert.set("uAlbedo", 0);
-                inst.tex->bind(0);
-            } else {
-                lambert.set("uUseTexture", 0);
-            }
+            pbrModelShader.set("uModel", inst.model);
+            pbrModelShader.set("uNormalMat", glm::mat3(glm::transpose(glm::inverse(inst.model))));
+            pbrModelShader.set("uBaseColor", inst.color);
+            pbrModelShader.set("uMaterialOverride", inst.material);
+            pbrModelShader.set("uUVScale", inst.uvScale);
             inst.mesh->draw();
         }
+        fb_unbind(fbw, fbh);
 
-        // INSTANCED-DRAW: one draw call for all cubes.
-        {
-            instShader.use();
-            instShader.set("uView",       cam.view());
-            instShader.set("uProj",       proj);
-            instShader.set("uCameraPos",  cam.pos);
-            instShader.set("uLightDir",   lightDir);
-            instShader.set("uLightColor", glm::vec3(1.0f, 0.96f, 0.90f));
-            instShader.set("uAmbient",    glm::vec3(0.15f, 0.16f, 0.20f));
-            instShader.set("uUseTexture", 0);
-            instShader.set("uUVScale",    glm::vec2(1,1));
-            instShader.set("uCrateTex",   2);
-            if (crateTex.id) crateTex.bind(2);
-            instShader.set("uLightSpace",  shadow.matrix());
-            instShader.set("uShadowMap",   1);
-            instShader.set("uShadowTexel", 1.0f / (float)shadow.size);
-            instShader.set("uCameraPos",   cam.pos);
-            instShader.set("uFogHorizon",  skyHorizon);
-            instShader.set("uFogZenith",   skyZenith);
-            instShader.set("uFogDensity",  fogDensity);
-            shadow.bindForReading(1);
-            instancedCube.upload(cubeModels, cubeColors, cubeMaterials);
-            instancedCube.draw();
-        }
+        // ---------- Tonemap G-buffer attachment 0 -> backbuffer ----------
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, fbw, fbh);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glClearColor(0.f, 0.f, 0.f, 1.f);
+        glClear(GL_COLOR_BUFFER_BIT);
 
-        { // FPS-COUNT
-            static int frames = 0;
-            static double t0 = glfwGetTime();
-            frames++;
-            double now = glfwGetTime();
-            if (now - t0 >= 1.0) {
-                std::cerr << "FPS: " << (frames / (now - t0)) << "\n";
-                frames = 0; t0 = now;
-            }
-        }
+        pass_use(&tonemapPass);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, gbuf.color);
+        pass_set_i32(&tonemapPass, "uScene", 0);
+        pass_set_vec2(&tonemapPass, "uInvSize", glm::vec2(1.f/fbw, 1.f/fbh));
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+
         glfwSwapBuffers(win);
         glfwPollEvents();
     }
 
+    // Cleanup: destroy GL objects while the context is alive
+    if (gbuf.fbo)    fb_destroy(&gbuf);
+    if (sceneFB.fbo) fb_destroy(&sceneFB);
+    pass_destroy(&tonemapPass);
+
     glfwDestroyWindow(win);
-    floorTex.id = 0;   // GL context is dead; don't call glDeleteTextures
     glfwTerminate();
     return 0;
 }

@@ -1,0 +1,34 @@
+#version 330 core
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNormal;
+layout(location=2) in vec2 aUV;
+
+uniform mat4 uModel;
+uniform mat4 uView;
+uniform mat4 uViewProj;
+uniform mat4 uLightVP;
+uniform mat3 uNormalMat;
+uniform vec3 uBaseColor;
+uniform float uMaterialOverride;
+uniform vec2  uUVScale;
+
+out vec3 vWorldPos;
+out vec3 vNormal;
+out vec2 vUV;
+out vec3 vColor;
+out float vMaterial;
+out vec4 vLightSpacePos;
+out float vViewDepth;
+
+void main() {
+    vec4 worldPos = uModel * vec4(aPos, 1.0);
+    vWorldPos = worldPos.xyz;
+    vNormal = normalize(uNormalMat * aNormal);
+    vUV = aUV * uUVScale;
+    vColor = uBaseColor;
+    vMaterial = uMaterialOverride;
+    vLightSpacePos = uLightVP * worldPos;
+    gl_Position = uViewProj * worldPos;
+    vec4 viewPos = uView * worldPos;
+    vViewDepth = -viewPos.z;
+}

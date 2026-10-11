@@ -54,3 +54,7 @@ struct Mesh {
         glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, nullptr);
     }
 };
+
+// Primitive builders
+Mesh makeCube();
+Mesh makePlane(float size);
