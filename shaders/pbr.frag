@@ -27,6 +27,23 @@ uniform sampler2D uSSAO;
 uniform sampler2D uSH;
 uniform sampler2D uSSGI;
 
+// PBR material inputs. Set per-draw from the Instance's Material.
+uniform sampler2D uBaseColorTex;
+uniform sampler2D uMRTex;
+uniform sampler2D uNormalTex;
+uniform sampler2D uEmissiveTex;
+uniform sampler2D uOcclusionTex;
+uniform vec3  uBaseColorFactor;
+uniform float uMetallicFactor;
+uniform float uRoughnessFactor;
+uniform vec3  uEmissiveFactor;
+uniform int   uHasBaseColor;
+uniform int   uHasMR;
+uniform int   uHasNormal;
+uniform int   uHasEmissive;
+uniform int   uHasOcclusion;
+uniform int   uIsPBR;        // 1 if the Instance has a Material
+
 layout(location = 0) out vec4 fragColor;
 layout(location = 1) out vec4 gAlbedo;
 layout(location = 2) out vec4 gNormal;
@@ -71,7 +88,6 @@ float shadowPCF(int cascade, vec3 worldPos, float bias) {
     vec4 lsPos = uLightSpace[cascade] * vec4(worldPos, 1.0);
     vec3 proj  = lsPos.xyz / lsPos.w * 0.5 + 0.5;
     if (proj.z > 1.0) return 1.0;
-
     float sum = 0.0;
     for (int x = -2; x <= 2; ++x)
         for (int y = -2; y <= 2; ++y) {
@@ -107,16 +123,43 @@ vec3 evalSpecular(vec3 F0, float rough, float NdotV, float NdotL, float NdotH, f
 }
 
 void main() {
-    vec3 albedo = vColor;
-    float roughness = 0.7;
-    if (vMaterial > 1.5) {
+    // Material resolution:
+    //   uIsPBR == 1   -> use the pbr material textures and factors
+    //   vMaterial == 2 -> ground texture
+    //   vMaterial == 1 -> crate texture
+    //   else          -> flat vColor
+    vec3 albedo;
+    float roughness;
+    float metallic;
+
+    if (uIsPBR == 1) {
+        albedo = uBaseColorFactor;
+        if (uHasBaseColor == 1) albedo *= texture(uBaseColorTex, vUV).rgb;
+        metallic  = uMetallicFactor;
+        roughness = uRoughnessFactor;
+        if (uHasMR == 1) {
+            vec4 mr = texture(uMRTex, vUV);
+            roughness *= mr.g;
+            metallic  *= mr.b;
+        }
+    } else if (vMaterial > 1.5) {
         albedo = texture(uGroundTex, vUV * uUVScale).rgb;
-        roughness = 0.95;
+        roughness = 0.95; metallic = 0.0;
     } else if (vMaterial > 0.5) {
         albedo = texture(uCrateTex, vUV).rgb;
-        roughness = 0.85;
+        roughness = 0.85; metallic = 0.0;
+    } else {
+        albedo = vColor;
+        roughness = 0.7; metallic = 0.0;
     }
-    float metallic = 0.0;
+    roughness = clamp(roughness, 0.04, 1.0);
+    metallic  = clamp(metallic, 0.0, 1.0);
+
+    // Emissive (only for PBR materials)
+    vec3 emissive = vec3(0.0);
+    if (uIsPBR == 1 && uHasEmissive == 1) {
+        emissive = texture(uEmissiveTex, vUV).rgb * uEmissiveFactor;
+    }
 
     vec3 N = normalize(vNormal);
     vec3 V = normalize(uCamPos - vWorldPos);
@@ -148,20 +191,12 @@ void main() {
 
     vec3 E_ambient = sh_irradiance(N);
     vec3 ambient = kD * albedo * E_ambient * ao;
+    ambient += kD * texture(uSSGI, ao_uv).rgb;
 
-    // SSGI: screen-space indirect diffuse, added to the ambient.
-    // One-frame lag — reads the previous frame's SSGI output.
-    vec3 ssgi = texture(uSSGI, ao_uv).rgb;
-    ambient += kD * ssgi;
-
-    vec3 color = direct + ambient;
+    vec3 color = direct + ambient + emissive;
 
     fragColor = vec4(color, 1.0);
-    gAlbedo   = vec4(albedo, 1.0);
-    gNormal   = vec4(N * 0.5 + 0.5, roughness);
-    // Pack prevUV into the unused alpha channels of two attachments.
-    // gAlbedo.a and gEmissive.a are both free (albedo alpha was unused,
-    // emissive alpha was a placeholder 1.0).
     gAlbedo   = vec4(albedo, vPrevUV.x);
-    gEmissive = vec4(0.0, 0.0, 0.0, vPrevUV.y);
+    gNormal   = vec4(N * 0.5 + 0.5, roughness);
+    gEmissive = vec4(emissive, vPrevUV.y);
 }

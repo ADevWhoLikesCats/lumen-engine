@@ -5,6 +5,25 @@
 #include <cstdint>
 #include <cstddef>
 
+// PBR material — pointers are owned by the loader's texture pool, not by
+// this struct. A null pointer means "slot not present, use the factor".
+struct Material {
+    GLuint basecolor = 0;
+    GLuint metallicRoughness = 0;
+    GLuint normal = 0;
+    GLuint emissive = 0;
+    GLuint occlusion = 0;
+
+    glm::vec3 baseColorFactor{1.f, 1.f, 1.f};
+    float     metallicFactor  = 0.f;
+    float     roughnessFactor = 1.f;
+    float     normalScale     = 1.f;
+    glm::vec3 emissiveFactor{0.f, 0.f, 0.f};
+    float     occlusionStrength = 1.f;
+
+    bool doubleSided = false;
+};
+
 struct Vertex { glm::vec3 pos; glm::vec3 nrm; glm::vec2 uv; };
 
 struct Mesh {

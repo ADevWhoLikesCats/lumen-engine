@@ -12,6 +12,7 @@
 #include "pass.h"
 #include "framebuffer.h"
 #include "mesh.h"
+#include "glb_loader.h"
 #include "instanced.h"
 #include "shadowmap.h"
 #include "texture.h"
@@ -224,12 +225,14 @@ int main() {
         const Texture* tex;
         glm::vec2   uvScale;
         float       material;
+        const Material* mat = nullptr;   // PBR material, or null
     };
     std::vector<Instance> scene;
 
     auto add = [&](const Mesh& m, glm::mat4 xf, glm::vec3 c,
-                   const Texture* t = nullptr, glm::vec2 uvs = {1,1}, float mat = 0.f) {
-        scene.push_back({&m, xf, c, t, uvs, mat});
+                   const Texture* t = nullptr, glm::vec2 uvs = {1,1}, float mat = 0.f,
+                   const Material* pbr = nullptr) {
+        scene.push_back({&m, xf, c, t, uvs, mat, pbr});
     };
 
     // Floor (textured, big quad)
@@ -273,6 +276,14 @@ int main() {
                 world.push_back(OBB::fromMatrix(m, glm::vec3(0.5f)));
             }
         }
+    }
+
+    // ---------- Load GLB model ----------
+    std::vector<GLBMesh> helmet = loadGLB("assets/damaged_helmet.glb");
+    for (auto& gm : helmet) {
+        glm::mat4 xf = glm::translate(glm::mat4(1.f), glm::vec3(48.f, 2.f, 44.f))
+                     * glm::scale(glm::mat4(1.f), glm::vec3(3.f, 3.f, 3.f));
+        add(gm.mesh, xf, {1,1,1}, nullptr, {1,1}, 0.f, &gm.material);
     }
 
     // Split cube instances from non-cube instances
@@ -627,6 +638,48 @@ int main() {
             pbrModelShader.set("uBaseColor", inst.color);
             pbrModelShader.set("uMaterialOverride", inst.material);
             pbrModelShader.set("uUVScale", inst.uvScale);
+
+            if (inst.mat) {
+                pbrModelShader.set("uIsPBR", 1);
+                const Material& M = *inst.mat;
+                pbrModelShader.set("uBaseColorFactor", M.baseColorFactor);
+                pbrModelShader.set("uMetallicFactor", M.metallicFactor);
+                pbrModelShader.set("uRoughnessFactor", M.roughnessFactor);
+                pbrModelShader.set("uEmissiveFactor", M.emissiveFactor);
+                pbrModelShader.set("uHasBaseColor", M.basecolor ? 1 : 0);
+                pbrModelShader.set("uHasMR",        M.metallicRoughness ? 1 : 0);
+                pbrModelShader.set("uHasNormal",    M.normal ? 1 : 0);
+                pbrModelShader.set("uHasEmissive",  M.emissive ? 1 : 0);
+                pbrModelShader.set("uHasOcclusion", M.occlusion ? 1 : 0);
+                pbrModelShader.set("uBaseColorTex",  7);
+                pbrModelShader.set("uMRTex",         8);
+                pbrModelShader.set("uNormalTex",     9);
+                pbrModelShader.set("uEmissiveTex",   10);
+                pbrModelShader.set("uOcclusionTex",  11);
+                if (M.basecolor) {
+                    glActiveTexture(GL_TEXTURE7);
+                    glBindTexture(GL_TEXTURE_2D, M.basecolor);
+                }
+                if (M.metallicRoughness) {
+                    glActiveTexture(GL_TEXTURE8);
+                    glBindTexture(GL_TEXTURE_2D, M.metallicRoughness);
+                }
+                if (M.normal) {
+                    glActiveTexture(GL_TEXTURE9);
+                    glBindTexture(GL_TEXTURE_2D, M.normal);
+                }
+                if (M.emissive) {
+                    glActiveTexture(GL_TEXTURE10);
+                    glBindTexture(GL_TEXTURE_2D, M.emissive);
+                }
+                if (M.occlusion) {
+                    glActiveTexture(GL_TEXTURE11);
+                    glBindTexture(GL_TEXTURE_2D, M.occlusion);
+                }
+                glActiveTexture(GL_TEXTURE0);
+            } else {
+                pbrModelShader.set("uIsPBR", 0);
+            }
             inst.mesh->draw();
         }
         fb_unbind(fbw, fbh);

@@ -3,4 +3,10 @@
 #include <vector>
 #include <string>
 
-std::vector<Mesh> loadGLB(const std::string& path);
+struct GLBMesh {
+    Mesh     mesh;
+    Material material;
+};
+
+// Load a .glb, returning each primitive's geometry + material.
+std::vector<GLBMesh> loadGLB(const std::string& path);
