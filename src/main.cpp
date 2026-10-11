@@ -286,6 +286,8 @@ int main() {
 
     // ---------- Tonemap pass ----------
     Pass tonemapPass = pass_create("shaders/tonemap.vert", "shaders/tonemap.frag");
+    Pass ssaoPass      = pass_create("shaders/fullscreen.vert", "shaders/ssao.frag");
+    Pass ssaoBlurPass  = pass_create("shaders/fullscreen.vert", "shaders/ssao_blur.frag");
 
     // ---------- Per-frame state ----------
     Camera cam;
@@ -300,6 +302,8 @@ int main() {
     float     lightIntensity = 1.8f;
 
     Framebuffer sceneFB;   // HDR lit scene with a depth texture
+    Framebuffer ssaoFB;    // R8 AO, raw
+    Framebuffer ssaoBlurFB;// R8 AO, blurred
     Framebuffer gbuf;      // G-buffer (4 MRT attachments, borrowed depth)
     int lastW = 0, lastH = 0;
 
@@ -308,8 +312,12 @@ int main() {
         lastW = w; lastH = h;
         if (sceneFB.fbo) fb_destroy(&sceneFB);
         if (gbuf.fbo)    fb_destroy(&gbuf);
-        sceneFB = fb_create_with_depth_tex(w, h, FB_RGBA16F);
-        gbuf    = fb_create_gbuffer(w, h, sceneFB.depth);
+    if (ssaoFB.fbo)  fb_destroy(&ssaoFB);
+    if (ssaoBlurFB.fbo) fb_destroy(&ssaoBlurFB);
+        sceneFB     = fb_create_with_depth_tex(w, h, FB_RGBA16F);
+        gbuf        = fb_create_gbuffer(w, h, sceneFB.depth);
+        ssaoFB      = fb_create(w, h, FB_R8);
+        ssaoBlurFB  = fb_create(w, h, FB_R8);
     };
 
     float lastTime = (float)glfwGetTime();
@@ -368,6 +376,42 @@ int main() {
         }
         shadow.unbindForWriting();
 
+        // ---------- SSAO pass ----------
+        // Reads sceneFB.depth (last frame's depth — one-frame lag is fine for AO).
+        {
+            glm::mat4 invVP = glm::inverse(viewProj);
+
+            fb_bind(&ssaoFB);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
+            glClearColor(1,1,1,1);
+            glClear(GL_COLOR_BUFFER_BIT);
+            pass_use(&ssaoPass);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, sceneFB.depth);
+            pass_set_i32(&ssaoPass, "uSceneDepth", 0);
+            pass_set_mat4(&ssaoPass, "uInvViewProj", invVP);
+            pass_set_mat4(&ssaoPass, "uViewProj", viewProj);
+            pass_set_vec3(&ssaoPass, "uCamPos", cam.pos);
+            pass_set_vec2(&ssaoPass, "uResolution", glm::vec2(fbw, fbh));
+            pass_set_f32(&ssaoPass, "uRadius", 0.5f);
+            pass_set_f32(&ssaoPass, "uBias", 0.02f);
+            pass_set_f32(&ssaoPass, "uIntensity", 1.0f);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+
+            fb_bind(&ssaoBlurFB);
+            glClear(GL_COLOR_BUFFER_BIT);
+            pass_use(&ssaoBlurPass);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, ssaoFB.color);
+            pass_set_i32(&ssaoBlurPass, "uSSAO", 0);
+            pass_set_vec2(&ssaoBlurPass, "uInvResolution", glm::vec2(1.f/fbw, 1.f/fbh));
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+
+            glEnable(GL_DEPTH_TEST);
+            glEnable(GL_CULL_FACE);
+        }
+
         // ---------- Geometry pass -> G-buffer ----------
         fb_bind(&gbuf);
         {
@@ -399,6 +443,10 @@ int main() {
         pbrInstShader.set("uShadowTexel", 1.0f / (float)shadow.size);
         pbrInstShader.set("uShadowEnabled", 1);
         pbrInstShader.set("uCrateTex",    2);
+        pbrInstShader.set("uSSAO",        4);
+        glActiveTexture(GL_TEXTURE4);
+        glBindTexture(GL_TEXTURE_2D, ssaoBlurFB.color);
+        glActiveTexture(GL_TEXTURE0);
         shadow.bindForReading(1);
         if (crateTex.id) crateTex.bind(2);
         instancedCube.upload(cubeModels, cubeColors, cubeMaterials);
@@ -423,6 +471,7 @@ int main() {
         pbrModelShader.set("uShadowTexel", 1.0f / (float)shadow.size);
         pbrModelShader.set("uShadowEnabled", 1);
         pbrModelShader.set("uCrateTex",    2);
+        pbrModelShader.set("uSSAO",        4);
         pbrModelShader.set("uGroundTex",   3);
         if (floorTex.id) floorTex.bind(3);
         shadow.bindForReading(1);
@@ -461,6 +510,8 @@ int main() {
 
     // Cleanup: destroy GL objects while the context is alive
     if (gbuf.fbo)    fb_destroy(&gbuf);
+    if (ssaoFB.fbo)  fb_destroy(&ssaoFB);
+    if (ssaoBlurFB.fbo) fb_destroy(&ssaoBlurFB);
     if (sceneFB.fbo) fb_destroy(&sceneFB);
     pass_destroy(&tonemapPass);
 

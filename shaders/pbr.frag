@@ -21,6 +21,7 @@ uniform int   uShadowEnabled;
 
 uniform sampler2D uCrateTex;
 uniform sampler2D uGroundTex;
+uniform sampler2D uSSAO;
 uniform vec2      uUVScale;
 
 layout(location = 0) out vec4 fragColor;
@@ -114,7 +115,11 @@ void main() {
     vec3 specular = evalSpecular(F0, roughness, NdotV, NdotL, NdotH, VdotH) * radiance;
     vec3 direct   = (diffuse + specular) * NdotL * shadow;
 
-    vec3 ambient = albedo * vec3(0.12, 0.12, 0.14);
+    // Sample ambient occlusion from the previous frame's SSAO pass
+    vec2 ao_uv = gl_FragCoord.xy / vec2(textureSize(uSSAO, 0));
+    float ao = texture(uSSAO, ao_uv).r;
+
+    vec3 ambient = albedo * vec3(0.12, 0.12, 0.14) * ao;
     vec3 color = direct + ambient;
 
     fragColor = vec4(color, 1.0);
