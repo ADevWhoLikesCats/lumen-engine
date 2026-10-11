@@ -7,6 +7,8 @@ in float vMaterial;
 in vec4 vLightSpacePos;
 in float vViewDepth;
 in vec2 vPrevUV;
+in vec3 vTangent;
+in vec3 vBitangent;
 
 uniform vec3  uCamPos;
 uniform vec3  uLightDir;
@@ -26,6 +28,9 @@ uniform vec2      uUVScale;
 uniform sampler2D uSSAO;
 uniform sampler2D uSH;
 uniform sampler2D uSSGI;
+uniform sampler2D uProbeSGs;
+uniform vec3      uSceneGridMin;
+uniform vec3      uSceneGridMax;
 
 // PBR material inputs. Set per-draw from the Instance's Material.
 uniform sampler2D uBaseColorTex;
@@ -40,8 +45,10 @@ uniform vec3  uEmissiveFactor;
 uniform int   uHasBaseColor;
 uniform int   uHasMR;
 uniform int   uHasNormal;
+uniform float uNormalScale;
 uniform int   uHasEmissive;
 uniform int   uHasOcclusion;
+uniform float uOcclusionStrength;
 uniform int   uIsPBR;        // 1 if the Instance has a Material
 
 layout(location = 0) out vec4 fragColor;
@@ -122,6 +129,35 @@ vec3 evalSpecular(vec3 F0, float rough, float NdotV, float NdotL, float NdotH, f
     return (D * G * F) / max(4.0 * NdotV * NdotL, 1e-4);
 }
 
+
+vec3 sg_specular_at_probe(vec3 R, float roughness, int probe_row) {
+    vec3 accum = vec3(0.0);
+    float rough2 = max(roughness * roughness, 1e-4);
+    for (int i = 0; i < 32; ++i) {
+        vec4 axis_sharp = texelFetch(uProbeSGs, ivec2(i * 2 + 0, probe_row), 0);
+        vec4 color_w    = texelFetch(uProbeSGs, ivec2(i * 2 + 1, probe_row), 0);
+        vec3  axis      = axis_sharp.xyz;
+        float sharp     = axis_sharp.w;
+        vec3  color     = color_w.rgb;
+        float w         = color_w.a;
+        float s = sharp / (1.0 + sharp * rough2 * 2.0);
+        float k = exp(s * (dot(R, axis) - 1.0));
+        accum += color * k * w;
+    }
+    return max(accum * 0.10, vec3(0.0));
+}
+
+vec3 sg_specular(vec3 worldPos, vec3 R, float roughness) {
+    vec3 span = max(uSceneGridMax - uSceneGridMin, vec3(1e-4));
+    vec3 t = (worldPos - uSceneGridMin) / span;
+    t = clamp(t, vec3(0.0), vec3(0.999));
+    int px = int(t.x * 8.0);
+    int py = int(t.y * 4.0);
+    int pz = int(t.z * 8.0);
+    int row = pz * (8 * 4) + py * 8 + px;
+    return sg_specular_at_probe(R, roughness, row);
+}
+
 void main() {
     // Material resolution:
     //   uIsPBR == 1   -> use the pbr material textures and factors
@@ -162,6 +198,14 @@ void main() {
     }
 
     vec3 N = normalize(vNormal);
+    if (uIsPBR == 1 && uHasNormal == 1) {
+        vec3 nmap = texture(uNormalTex, vUV).rgb * 2.0 - 1.0;
+        nmap.xy *= uNormalScale;
+        mat3 TBN = mat3(normalize(vTangent),
+                        normalize(vBitangent),
+                        N);
+        N = normalize(TBN * nmap);
+    }
     vec3 V = normalize(uCamPos - vWorldPos);
     vec3 L = normalize(-uLightDir);
     vec3 H = normalize(V + L);
@@ -187,13 +231,32 @@ void main() {
     vec3 direct   = (diffuse + specular) * NdotL * shadow;
 
     vec2 ao_uv = gl_FragCoord.xy / vec2(textureSize(uSSAO, 0));
-    float ao = texture(uSSAO, ao_uv).r;
+    float ssao = texture(uSSAO, ao_uv).r;
+
+    // Material occlusion map (glTF occlusion texture: R channel).
+    // Blends with SSAO — the map catches baked detail, SSAO catches
+    // dynamic geometry.
+    float matAO = 1.0;
+    if (uIsPBR == 1 && uHasOcclusion == 1) {
+        float sampled = texture(uOcclusionTex, vUV).r;
+        matAO = mix(1.0, sampled, uOcclusionStrength);
+    }
+    float ao = ssao * matAO;
 
     vec3 E_ambient = sh_irradiance(N);
     vec3 ambient = kD * albedo * E_ambient * ao;
     ambient += kD * texture(uSSGI, ao_uv).rgb;
 
-    vec3 color = direct + ambient + emissive;
+    // SG specular fallback — added to the lit color as a reflection term.
+    // SSR will composite over this when the ray is on-screen.
+    vec3 R = reflect(-V, N);
+    vec3 sg_refl = sg_specular(vWorldPos, R, roughness);
+    vec3 F_spec_ambient = F_Schlick(F0, NdotV);
+    float roughAtten = 1.0 - roughness * 0.6;
+    vec3 indirect_specular = min(sg_refl * F_spec_ambient * roughAtten, vec3(2.0));
+    indirect_specular *= smoothstep(0.02, 0.15, NdotV);   // grazing fade
+
+    vec3 color = direct + ambient + emissive + indirect_specular;
 
     fragColor = vec4(color, 1.0);
     gAlbedo   = vec4(albedo, vPrevUV.x);

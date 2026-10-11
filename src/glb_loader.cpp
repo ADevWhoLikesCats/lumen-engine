@@ -4,10 +4,57 @@
 #include <tiny_gltf.h>
 #include "glb_loader.h"
 
+#include <cmath>
 #include <iostream>
 #include <unordered_map>
 
 using namespace glm;
+
+
+// Compute per-vertex tangents from positions + UVs. Standard technique:
+// for each triangle, build the TBN matrix from the UV gradient, accumulate
+// per vertex, then orthonormalize against the vertex normal.
+static void computeTangents(std::vector<Vertex>& verts,
+                            const std::vector<uint32_t>& indices) {
+    std::vector<glm::vec3> tanAccum(verts.size(), glm::vec3(0));
+    std::vector<glm::vec3> bitAccum(verts.size(), glm::vec3(0));
+
+    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+        uint32_t i0 = indices[i], i1 = indices[i+1], i2 = indices[i+2];
+        const Vertex& v0 = verts[i0];
+        const Vertex& v1 = verts[i1];
+        const Vertex& v2 = verts[i2];
+
+        glm::vec3 e1 = v1.pos - v0.pos;
+        glm::vec3 e2 = v2.pos - v0.pos;
+        glm::vec2 d1 = v1.uv  - v0.uv;
+        glm::vec2 d2 = v2.uv  - v0.uv;
+
+        float det = d1.x * d2.y - d2.x * d1.y;
+        if (std::abs(det) < 1e-8f) continue;
+        float r = 1.0f / det;
+
+        glm::vec3 T = (e1 * d2.y - e2 * d1.y) * r;
+        glm::vec3 B = (e2 * d1.x - e1 * d2.x) * r;
+
+        tanAccum[i0] += T; tanAccum[i1] += T; tanAccum[i2] += T;
+        bitAccum[i0] += B; bitAccum[i1] += B; bitAccum[i2] += B;
+    }
+
+    for (size_t i = 0; i < verts.size(); ++i) {
+        glm::vec3 n = verts[i].nrm;
+        glm::vec3 t = tanAccum[i];
+        if (glm::dot(t, t) < 1e-8f) {
+            verts[i].tangent = glm::vec4(0,0,0,1);
+            continue;
+        }
+        // Gram-Schmidt orthogonalize
+        t = glm::normalize(t - n * glm::dot(n, t));
+        // Handedness: sign of dot(cross(N, T), B)
+        float w = (glm::dot(glm::cross(n, t), bitAccum[i]) < 0.f) ? -1.f : 1.f;
+        verts[i].tangent = glm::vec4(t, w);
+    }
+}
 
 static vec3 readVec3(const float* p) { return {p[0], p[1], p[2]}; }
 static vec2 readVec2(const float* p) { return {p[0], p[1]}; }
@@ -188,6 +235,20 @@ std::vector<GLBMesh> loadGLB(const std::string& path) {
                     uvs.push_back(readVec2(u + i * s));
             }
 
+            std::vector<vec4> tangents;
+            auto itTan = prim.attributes.find("TANGENT");
+            if (itTan != prim.attributes.end()) {
+                const auto& acc = model.accessors[itTan->second];
+                const auto& bv  = model.bufferViews[acc.bufferView];
+                const auto& buf = model.buffers[bv.buffer];
+                const float* t = reinterpret_cast<const float*>(
+                    buf.data.data() + bv.byteOffset + acc.byteOffset);
+                size_t s = bv.byteStride ? bv.byteStride / sizeof(float) : 4;
+                tangents.reserve(acc.count);
+                for (size_t i = 0; i < acc.count; ++i)
+                    tangents.push_back(vec4(t[i*s+0], t[i*s+1], t[i*s+2], t[i*s+3]));
+            }
+
             std::vector<uint32_t> indices;
             if (prim.indices >= 0) {
                 const auto& acc = model.accessors[prim.indices];
@@ -216,7 +277,13 @@ std::vector<GLBMesh> loadGLB(const std::string& path) {
                 v.pos = positions[i];
                 v.nrm = i < normals.size() ? normals[i] : vec3(0,1,0);
                 v.uv  = i < uvs.size()     ? uvs[i]     : vec2(0);
+                v.tangent = i < tangents.size() ? tangents[i] : vec4(0,0,0,1);
                 verts.push_back(v);
+            }
+
+            // Fallback: if the model didn't provide tangents, compute them.
+            if (tangents.empty()) {
+                computeTangents(verts, indices);
             }
 
             GLBMesh gm;

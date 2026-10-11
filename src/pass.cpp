@@ -94,11 +94,19 @@ void pass_destroy(Pass* p) {
 }
 
 void pass_use(Pass* p) {
+    // VAO-DBG: drain errors first, then check each step
+    while (glGetError() != GL_NO_ERROR) {}
+
     glUseProgram(p->prog);
+    GLenum e1 = glGetError();
+
+    GLint vaoExists = glIsVertexArray(p->vao);
     glBindVertexArray(p->vao);
-    GLenum e = glGetError();
-    if (e != GL_NO_ERROR) {
-        fprintf(stderr, "pass_use failed: prog=%u vao=%u err=0x%04X\n", p->prog, p->vao, e);
+    GLenum e2 = glGetError();
+
+    if (e1 != GL_NO_ERROR || e2 != GL_NO_ERROR) {
+        fprintf(stderr, "pass_use DBG: prog=%u vao=%u isValid=%d e_prog=0x%04X e_vao=0x%04X\n",
+                p->prog, p->vao, vaoExists, e1, e2);
         while (glGetError() != GL_NO_ERROR) {}
     }
 }

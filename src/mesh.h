@@ -24,7 +24,9 @@ struct Material {
     bool doubleSided = false;
 };
 
-struct Vertex { glm::vec3 pos; glm::vec3 nrm; glm::vec2 uv; };
+struct Vertex { glm::vec3 pos; glm::vec3 nrm; glm::vec2 uv; 
+    glm::vec4 tangent{0.f, 0.f, 0.f, 1.f};
+};
 
 struct Mesh {
     GLuint vao = 0, vbo = 0, ibo = 0;
@@ -51,6 +53,8 @@ struct Mesh {
         glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex,nrm));
         glEnableVertexAttribArray(2);
         glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex,uv));
+        glEnableVertexAttribArray(3);
+        glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex,tangent));
 
         glBindVertexArray(0);
         indexCount = (GLsizei)idx.size();

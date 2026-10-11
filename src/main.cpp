@@ -11,6 +11,8 @@
 
 #include "pass.h"
 #include "framebuffer.h"
+#include "tri_grid.h"
+#include "probe_grid.h"
 #include "mesh.h"
 #include "glb_loader.h"
 #include "instanced.h"
@@ -322,6 +324,8 @@ int main() {
     Pass taaPass       = pass_create("shaders/fullscreen.vert", "shaders/taa.frag");
     Pass fogRaymarchPass = pass_create("shaders/fullscreen.vert", "shaders/fog_raymarch.frag");
     Pass fogCompositePass = pass_create("shaders/fullscreen.vert", "shaders/fog_composite.frag");
+    Pass ssrPass          = pass_create("shaders/fullscreen.vert", "shaders/ssr.frag");
+    Pass ssrCompositePass = pass_create("shaders/fullscreen.vert", "shaders/ssr_composite.frag");
     Pass octaCapturePass = pass_create("shaders/fullscreen.vert", "shaders/octa_capture.frag");
     Pass shProjectPass   = pass_create("shaders/fullscreen.vert", "shaders/sh_project.frag");
 
@@ -340,6 +344,8 @@ int main() {
     Framebuffer octaCaptureFB = fb_create(128, 128, FB_RGBA16F);
     Framebuffer shFB         = fb_create(9, 1, FB_RGBA32F);
     Framebuffer sceneFB;   // HDR lit scene with a depth texture
+    Framebuffer ssrFB;             // RGBA16F, rgb=reflection, a=hit confidence
+    Framebuffer ssrCompositeFB;    // RGBA16F, lit + reflection
     Framebuffer fogFB;             // half-res fog (rgba=scatter, a=transmit)
     Framebuffer fogCompositeFB;    // full-res composited scene
     Framebuffer taaHistory[2];   // ping-pong
@@ -416,6 +422,100 @@ int main() {
         glEnable(GL_DEPTH_TEST);
         glEnable(GL_CULL_FACE);
         std::cerr << "[SH] probe captured and projected\n";
+    }
+
+    // PROBE-BAKE: build a flat triangle list for the SG bake, then bake once.
+    TriGrid triGrid;
+    ProbeGrid probeGrid;
+    {
+        std::vector<float> triPos;
+        std::vector<float> triAlb;
+
+        auto emitTri = [&](const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
+                           const glm::vec3& alb) {
+            triPos.push_back(a.x); triPos.push_back(a.y); triPos.push_back(a.z);
+            triPos.push_back(b.x); triPos.push_back(b.y); triPos.push_back(b.z);
+            triPos.push_back(c.x); triPos.push_back(c.y); triPos.push_back(c.z);
+            triAlb.push_back(alb.x); triAlb.push_back(alb.y); triAlb.push_back(alb.z);
+        };
+
+        auto emitQuad = [&](const glm::vec3& p0, const glm::vec3& p1,
+                            const glm::vec3& p2, const glm::vec3& p3,
+                            const glm::vec3& alb) {
+            emitTri(p0, p1, p2, alb);
+            emitTri(p0, p2, p3, alb);
+        };
+
+        auto emitCube = [&](const glm::mat4& M, const glm::vec3& alb) {
+            glm::vec3 v[8];
+            int i = 0;
+            for (int z = 0; z < 2; ++z)
+                for (int y = 0; y < 2; ++y)
+                    for (int x = 0; x < 2; ++x) {
+                        glm::vec4 p = M * glm::vec4(x ? 0.5f : -0.5f,
+                                                    y ? 0.5f : -0.5f,
+                                                    z ? 0.5f : -0.5f, 1.f);
+                        v[i++] = glm::vec3(p);
+                    }
+            // Faces: (indices of the 8 corners: 0..7 in x,y,z order)
+            // front  z=+: 4,5,7,6
+            // back   z-: 0,2,3,1
+            // top    y=+: 2,3,7,6
+            // bottom y-: 0,1,5,4
+            // right  x=+: 1,3,7,5
+            // left   x-: 0,4,6,2
+            emitQuad(v[4], v[5], v[7], v[6], alb);
+            emitQuad(v[0], v[2], v[3], v[1], alb);
+            emitQuad(v[2], v[3], v[7], v[6], alb);
+            emitQuad(v[0], v[1], v[5], v[4], alb);
+            emitQuad(v[1], v[3], v[7], v[5], alb);
+            emitQuad(v[0], v[4], v[6], v[2], alb);
+        };
+
+        // Ground plane
+        {
+            glm::vec3 mn(0, 0, 0), mx(map.W*map.tile, 0, map.H*map.tile);
+            emitQuad(glm::vec3(mn.x, 0, mn.z),
+                     glm::vec3(mx.x, 0, mn.z),
+                     glm::vec3(mx.x, 0, mx.z),
+                     glm::vec3(mn.x, 0, mx.z),
+                     glm::vec3(0.35f, 0.45f, 0.25f));
+        }
+
+        // Walls and props (emitted as cubes at their OBB centers)
+        for (auto& inst : scene) {
+            if (inst.mesh == &cube) {
+                emitCube(inst.model, inst.color);
+            }
+        }
+        // Wait — cube instances were removed from scene. Use cubeModels instead.
+        for (size_t i = 0; i < cubeModels.size(); ++i) {
+            emitCube(cubeModels[i], cubeColors[i]);
+        }
+
+        // Helmet — approximate with its bounding box
+        for (auto& gm : helmet) {
+            // Its model matrix from the scene (find matching instance)
+            // For simplicity, approximate the helmet with a cube at its position.
+            glm::mat4 M = glm::translate(glm::mat4(1.f), glm::vec3(48.f, 2.f, 44.f))
+                        * glm::scale(glm::mat4(1.f), glm::vec3(3.f, 3.f, 3.f));
+            emitCube(M, glm::vec3(0.6f, 0.6f, 0.6f));
+        }
+
+        glm::vec3 gmin(0, -1, 0);
+        glm::vec3 gmax(map.W*map.tile, 4, map.H*map.tile);
+        triGrid = tri_grid_build(triPos, triAlb, (int)(triPos.size() / 9), gmin, gmax);
+
+        glm::vec3 probe_min(0, 0.5f, 0);
+        glm::vec3 probe_max(map.W*map.tile, 3.5f, map.H*map.tile);
+        probeGrid = probe_grid_create(probe_min, probe_max);
+
+        probe_grid_bake(&probeGrid, &triGrid,
+                        gmin, gmax,
+                        0.f, glm::vec3(0.35f, 0.45f, 0.25f),
+                        glm::vec3(0.65f, 0.75f, 0.90f),
+                        glm::vec3(0.15f, 0.35f, 0.75f),
+                        lightDir, lightColor, lightIntensity);
     }
 
     while (!glfwWindowShouldClose(win)) {
@@ -592,6 +692,12 @@ int main() {
         pbrInstShader.set("uSSAO",        4);
         pbrInstShader.set("uSH",          5);
         pbrInstShader.set("uSSGI",        6);
+        pbrInstShader.set("uProbeSGs",    12);
+        pbrInstShader.set("uSceneGridMin", probeGrid.grid_min);
+        pbrInstShader.set("uSceneGridMax", probeGrid.grid_max);
+        glActiveTexture(GL_TEXTURE12);
+        glBindTexture(GL_TEXTURE_2D, probeGrid.fb.color);
+        glActiveTexture(GL_TEXTURE0);
         glActiveTexture(GL_TEXTURE6);
         glBindTexture(GL_TEXTURE_2D, ssgiFB.color);
         glActiveTexture(GL_TEXTURE0);
@@ -628,6 +734,9 @@ int main() {
         pbrModelShader.set("uSSAO",        4);
         pbrModelShader.set("uSH",          5);
         pbrModelShader.set("uSSGI",        6);
+        pbrModelShader.set("uProbeSGs",    12);
+        pbrModelShader.set("uSceneGridMin", probeGrid.grid_min);
+        pbrModelShader.set("uSceneGridMax", probeGrid.grid_max);
         pbrModelShader.set("uGroundTex",   3);
         if (floorTex.id) floorTex.bind(3);
         shadow.bindForReading(1);
@@ -645,6 +754,7 @@ int main() {
                 pbrModelShader.set("uBaseColorFactor", M.baseColorFactor);
                 pbrModelShader.set("uMetallicFactor", M.metallicFactor);
                 pbrModelShader.set("uRoughnessFactor", M.roughnessFactor);
+                pbrModelShader.set("uNormalScale",     M.normalScale);
                 pbrModelShader.set("uEmissiveFactor", M.emissiveFactor);
                 pbrModelShader.set("uHasBaseColor", M.basecolor ? 1 : 0);
                 pbrModelShader.set("uHasMR",        M.metallicRoughness ? 1 : 0);
@@ -696,6 +806,50 @@ int main() {
                               0, 0, sceneFB.width, sceneFB.height,
                               GL_COLOR_BUFFER_BIT, GL_LINEAR);
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        }
+
+        // ---------- SSR pass ----------
+        {
+            glm::mat4 invVP = glm::inverse(viewProj);
+
+            fb_bind(&ssrFB);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
+            glClearColor(0,0,0,0);
+            glClear(GL_COLOR_BUFFER_BIT);
+            pass_use(&ssrPass);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, gbuf.color);
+            pass_set_i32(&ssrPass, "uSceneColor", 0);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, sceneFB.depth);
+            pass_set_i32(&ssrPass, "uSceneDepth", 1);
+            pass_set_mat4(&ssrPass, "uViewProj", viewProj);
+            pass_set_mat4(&ssrPass, "uInvViewProj", invVP);
+            pass_set_vec3(&ssrPass, "uCamPos", cam.pos);
+            pass_set_vec2(&ssrPass, "uResolution", glm::vec2(fbw, fbh));
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+
+            // Composite SSR over the lit color
+            fb_bind(&ssrCompositeFB);
+            glClear(GL_COLOR_BUFFER_BIT);
+            pass_use(&ssrCompositePass);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, gbuf.color);
+            pass_set_i32(&ssrCompositePass, "uSceneColor", 0);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, ssrFB.color);
+            pass_set_i32(&ssrCompositePass, "uSSRColor", 1);
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, sceneFB.depth);
+            pass_set_i32(&ssrCompositePass, "uSceneDepth", 2);
+            pass_set_mat4(&ssrCompositePass, "uInvViewProj", invVP);
+            pass_set_vec3(&ssrCompositePass, "uCamPos", cam.pos);
+            pass_set_vec2(&ssrCompositePass, "uResolution", glm::vec2(fbw, fbh));
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+
+            glEnable(GL_DEPTH_TEST);
+            glEnable(GL_CULL_FACE);
         }
 
         // ---------- Volumetric fog ----------
@@ -751,7 +905,7 @@ int main() {
             glClear(GL_COLOR_BUFFER_BIT);
             pass_use(&fogCompositePass);
             glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, gbuf.color);
+            glBindTexture(GL_TEXTURE_2D, ssrCompositeFB.color);
             pass_set_i32(&fogCompositePass, "uSceneColor", 0);
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_2D, fogFB.color);
@@ -835,6 +989,10 @@ int main() {
     if (ssaoBlurFB.fbo) fb_destroy(&ssaoBlurFB);
     if (sceneFB.fbo) fb_destroy(&sceneFB);
     pass_destroy(&tonemapPass);
+    tri_grid_destroy(&triGrid);
+    probe_grid_destroy(&probeGrid);
+    if (ssrFB.fbo) fb_destroy(&ssrFB);
+    if (ssrCompositeFB.fbo) fb_destroy(&ssrCompositeFB);
 
     glfwDestroyWindow(win);
     glfwTerminate();
