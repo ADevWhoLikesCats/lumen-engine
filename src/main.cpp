@@ -288,6 +288,8 @@ int main() {
     Pass tonemapPass = pass_create("shaders/tonemap.vert", "shaders/tonemap.frag");
     Pass ssaoPass      = pass_create("shaders/fullscreen.vert", "shaders/ssao.frag");
     Pass ssaoBlurPass  = pass_create("shaders/fullscreen.vert", "shaders/ssao_blur.frag");
+    Pass octaCapturePass = pass_create("shaders/fullscreen.vert", "shaders/octa_capture.frag");
+    Pass shProjectPass   = pass_create("shaders/fullscreen.vert", "shaders/sh_project.frag");
 
     // ---------- Per-frame state ----------
     Camera cam;
@@ -301,6 +303,8 @@ int main() {
     glm::vec3 lightColor(1.0f, 0.96f, 0.90f);
     float     lightIntensity = 1.8f;
 
+    Framebuffer octaCaptureFB = fb_create(128, 128, FB_RGBA16F);
+    Framebuffer shFB         = fb_create(9, 1, FB_RGBA32F);
     Framebuffer sceneFB;   // HDR lit scene with a depth texture
     Framebuffer ssaoFB;    // R8 AO, raw
     Framebuffer ssaoBlurFB;// R8 AO, blurred
@@ -312,6 +316,8 @@ int main() {
         lastW = w; lastH = h;
         if (sceneFB.fbo) fb_destroy(&sceneFB);
         if (gbuf.fbo)    fb_destroy(&gbuf);
+    fb_destroy(&octaCaptureFB);
+    fb_destroy(&shFB);
     if (ssaoFB.fbo)  fb_destroy(&ssaoFB);
     if (ssaoBlurFB.fbo) fb_destroy(&ssaoBlurFB);
         sceneFB     = fb_create_with_depth_tex(w, h, FB_RGBA16F);
@@ -321,6 +327,46 @@ int main() {
     };
 
     float lastTime = (float)glfwGetTime();
+    // SH probe: run once at startup. Captures the sky + ground from a
+    // probe at (48, 2, 48) — roughly the middle of the map.
+    {
+        glm::vec3 probePos(48.f, 2.f, 48.f);
+        glm::vec3 skyHorizon(0.80f, 0.85f, 0.95f);
+        glm::vec3 skyZenith (0.15f, 0.35f, 0.75f);
+        glm::vec3 groundAlbedo(0.55f, 0.60f, 0.35f);
+
+        fb_bind(&octaCaptureFB);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glClearColor(0,0,0,1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        pass_use(&octaCapturePass);
+        pass_set_vec3(&octaCapturePass, "uProbePos", probePos);
+        pass_set_vec3(&octaCapturePass, "uLightDir", lightDir);
+        pass_set_vec3(&octaCapturePass, "uLightColor", lightColor);
+        pass_set_f32 (&octaCapturePass, "uLightIntensity", lightIntensity);
+        pass_set_vec2(&octaCapturePass, "uInvResolution", glm::vec2(1.f/128.f, 1.f/128.f));
+        pass_set_f32 (&octaCapturePass, "uGroundY", 0.f);
+        pass_set_vec3(&octaCapturePass, "uGroundAlbedo", groundAlbedo);
+        pass_set_vec3(&octaCapturePass, "uSkyHorizon", skyHorizon);
+        pass_set_vec3(&octaCapturePass, "uSkyZenith",  skyZenith);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        fb_bind(&shFB);
+        glClearColor(0,0,0,1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        pass_use(&shProjectPass);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, octaCaptureFB.color);
+        pass_set_i32(&shProjectPass, "uOcta", 0);
+        pass_set_f32(&shProjectPass, "uOctaSize", 128.f);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_CULL_FACE);
+        std::cerr << "[SH] probe captured and projected\n";
+    }
+
     while (!glfwWindowShouldClose(win)) {
         float now = (float)glfwGetTime();
         float dt = now - lastTime; lastTime = now;
@@ -444,6 +490,10 @@ int main() {
         pbrInstShader.set("uShadowEnabled", 1);
         pbrInstShader.set("uCrateTex",    2);
         pbrInstShader.set("uSSAO",        4);
+        pbrInstShader.set("uSH",          5);
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_2D, shFB.color);
+        glActiveTexture(GL_TEXTURE0);
         glActiveTexture(GL_TEXTURE4);
         glBindTexture(GL_TEXTURE_2D, ssaoBlurFB.color);
         glActiveTexture(GL_TEXTURE0);
@@ -472,6 +522,7 @@ int main() {
         pbrModelShader.set("uShadowEnabled", 1);
         pbrModelShader.set("uCrateTex",    2);
         pbrModelShader.set("uSSAO",        4);
+        pbrModelShader.set("uSH",          5);
         pbrModelShader.set("uGroundTex",   3);
         if (floorTex.id) floorTex.bind(3);
         shadow.bindForReading(1);
@@ -510,6 +561,8 @@ int main() {
 
     // Cleanup: destroy GL objects while the context is alive
     if (gbuf.fbo)    fb_destroy(&gbuf);
+    fb_destroy(&octaCaptureFB);
+    fb_destroy(&shFB);
     if (ssaoFB.fbo)  fb_destroy(&ssaoFB);
     if (ssaoBlurFB.fbo) fb_destroy(&ssaoBlurFB);
     if (sceneFB.fbo) fb_destroy(&sceneFB);
