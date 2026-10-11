@@ -5,6 +5,7 @@ layout(location=2) in vec2 aUV;
 
 uniform mat4 uModel;
 uniform mat4 uView;
+uniform mat4 uPrevViewProj;
 uniform mat4 uViewProj;
 uniform mat4 uLightVP;
 uniform mat3 uNormalMat;
@@ -19,6 +20,7 @@ out vec3 vColor;
 out float vMaterial;
 out vec4 vLightSpacePos;
 out float vViewDepth;
+out vec2 vPrevUV;
 
 void main() {
     vec4 worldPos = uModel * vec4(aPos, 1.0);
@@ -28,6 +30,8 @@ void main() {
     vColor = uBaseColor;
     vMaterial = uMaterialOverride;
     vLightSpacePos = uLightVP * worldPos;
+    vec4 prevClip = uPrevViewProj * worldPos;
+    vPrevUV = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
     gl_Position = uViewProj * worldPos;
     vec4 viewPos = uView * worldPos;
     vViewDepth = -viewPos.z;

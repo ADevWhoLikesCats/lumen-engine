@@ -13,7 +13,7 @@ struct ShadowMap {
     GLsizei size    = 2048;
 
     // Far view-depth of each cascade (metres). Cascade 0 covers 0..splits[0].
-    float splits[CSM_CASCADE_COUNT] = { 8.0f, 24.0f, 80.0f };
+    float splits[CSM_CASCADE_COUNT] = { 20.0f, 50.0f, 140.0f };
 
     // Per-cascade light-space matrix (proj * view)
     glm::mat4 lightSpace[CSM_CASCADE_COUNT];

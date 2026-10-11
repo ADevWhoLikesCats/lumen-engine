@@ -143,6 +143,25 @@ struct Camera {
 };
 
 // ===============================================================
+// Halton sequence for TAA jitter
+// ===============================================================
+static float halton_seq(int index, int base) {
+    float f = 1.0f, r = 0.0f;
+    int i = index;
+    while (i > 0) {
+        f /= (float)base;
+        r += f * (float)(i % base);
+        i /= base;
+    }
+    return r;
+}
+static void taa_jitter(int frame, float* jx, float* jy) {
+    int idx = (frame % 8) + 1;
+    *jx = halton_seq(idx, 2) - 0.5f;
+    *jy = halton_seq(idx, 3) - 0.5f;
+}
+
+// ===============================================================
 // main
 // ===============================================================
 int main() {
@@ -288,6 +307,8 @@ int main() {
     Pass tonemapPass = pass_create("shaders/tonemap.vert", "shaders/tonemap.frag");
     Pass ssaoPass      = pass_create("shaders/fullscreen.vert", "shaders/ssao.frag");
     Pass ssaoBlurPass  = pass_create("shaders/fullscreen.vert", "shaders/ssao_blur.frag");
+    Pass ssgiPass      = pass_create("shaders/fullscreen.vert", "shaders/ssgi.frag");
+    Pass taaPass       = pass_create("shaders/fullscreen.vert", "shaders/taa.frag");
     Pass octaCapturePass = pass_create("shaders/fullscreen.vert", "shaders/octa_capture.frag");
     Pass shProjectPass   = pass_create("shaders/fullscreen.vert", "shaders/sh_project.frag");
 
@@ -299,13 +320,18 @@ int main() {
     player.radius = 0.3f;
     float vy = 0.f;
 
-    glm::vec3 lightDir = glm::normalize(glm::vec3(-0.4f, -1.0f, -0.3f));
+    glm::vec3 lightDir = glm::normalize(glm::vec3(-0.15f, -1.0f, -0.1f));
     glm::vec3 lightColor(1.0f, 0.96f, 0.90f);
     float     lightIntensity = 1.8f;
 
     Framebuffer octaCaptureFB = fb_create(128, 128, FB_RGBA16F);
     Framebuffer shFB         = fb_create(9, 1, FB_RGBA32F);
     Framebuffer sceneFB;   // HDR lit scene with a depth texture
+    Framebuffer taaHistory[2];   // ping-pong
+    int taaPing = 0;
+    int frameIndex = 0;
+    glm::mat4 prevViewProj(1.f);
+    Framebuffer ssgiFB;    // RGBA16F indirect diffuse
     Framebuffer ssaoFB;    // R8 AO, raw
     Framebuffer ssaoBlurFB;// R8 AO, blurred
     Framebuffer gbuf;      // G-buffer (4 MRT attachments, borrowed depth)
@@ -319,11 +345,19 @@ int main() {
     fb_destroy(&octaCaptureFB);
     fb_destroy(&shFB);
     if (ssaoFB.fbo)  fb_destroy(&ssaoFB);
+    if (ssgiFB.fbo)  fb_destroy(&ssgiFB);
     if (ssaoBlurFB.fbo) fb_destroy(&ssaoBlurFB);
         sceneFB     = fb_create_with_depth_tex(w, h, FB_RGBA16F);
         gbuf        = fb_create_gbuffer(w, h, sceneFB.depth);
         ssaoFB      = fb_create(w, h, FB_R8);
+        ssgiFB      = fb_create(w, h, FB_RGBA16F);
         ssaoBlurFB  = fb_create(w, h, FB_R8);
+        if (taaHistory[0].fbo) fb_destroy(&taaHistory[0]);
+        if (taaHistory[1].fbo) fb_destroy(&taaHistory[1]);
+        taaHistory[0] = fb_create(w, h, FB_RGBA16F);
+        taaHistory[1] = fb_create(w, h, FB_RGBA16F);
+        taaPing = 0;
+        frameIndex = 0;
     };
 
     float lastTime = (float)glfwGetTime();
@@ -401,6 +435,12 @@ int main() {
 
         float aspect = (float)fbw / (float)fbh;
         glm::mat4 proj = glm::perspective(glm::radians(70.f), aspect, 0.1f, 200.f);
+        {
+            float jx, jy;
+            taa_jitter(frameIndex, &jx, &jy);
+            proj[2][0] += jx * 2.0f / (float)fbw;
+            proj[2][1] += jy * 2.0f / (float)fbh;
+        }
         glm::mat4 view = cam.view();
         glm::mat4 viewProj = proj * view;
 
@@ -458,6 +498,48 @@ int main() {
             glEnable(GL_CULL_FACE);
         }
 
+        // ---------- SSGI pass ----------
+        // Reads sceneFB.color (prev lit), sceneFB.depth (prev), gbuf.color1/2/3 (prev).
+        {
+            glm::mat4 invVP = glm::inverse(viewProj);
+
+            fb_bind(&ssgiFB);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
+            glClearColor(0,0,0,1);
+            glClear(GL_COLOR_BUFFER_BIT);
+            pass_use(&ssgiPass);
+
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, sceneFB.color);
+            pass_set_i32(&ssgiPass, "uSceneColor", 0);
+
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, sceneFB.depth);
+            pass_set_i32(&ssgiPass, "uSceneDepth", 1);
+
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, gbuf.color1);   // albedo
+            pass_set_i32(&ssgiPass, "uGBufferAlbedo", 2);
+
+            glActiveTexture(GL_TEXTURE3);
+            glBindTexture(GL_TEXTURE_2D, gbuf.color2);   // normal+rough
+            pass_set_i32(&ssgiPass, "uGBufferNormal", 3);
+
+            glActiveTexture(GL_TEXTURE4);
+            glBindTexture(GL_TEXTURE_2D, gbuf.color3);   // emissive
+            pass_set_i32(&ssgiPass, "uGBufferEmissive", 4);
+
+            pass_set_mat4(&ssgiPass, "uInvViewProj", invVP);
+            pass_set_mat4(&ssgiPass, "uViewProj", viewProj);
+            pass_set_vec3(&ssgiPass, "uCamPos", cam.pos);
+            pass_set_vec2(&ssgiPass, "uResolution", glm::vec2(fbw, fbh));
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+
+            glEnable(GL_DEPTH_TEST);
+            glEnable(GL_CULL_FACE);
+        }
+
         // ---------- Geometry pass -> G-buffer ----------
         fb_bind(&gbuf);
         {
@@ -474,6 +556,7 @@ int main() {
         pbrInstShader.use();
         pbrInstShader.set("uViewProj",    viewProj);
         pbrInstShader.set("uView",        view);
+        pbrInstShader.set("uPrevViewProj", prevViewProj);
         for (int i = 0; i < CSM_CASCADE_COUNT; ++i) {
             char n[32]; std::snprintf(n, 32, "uLightSpace[%d]", i);
             pbrInstShader.set(n, shadow.lightSpace[i]);
@@ -491,6 +574,10 @@ int main() {
         pbrInstShader.set("uCrateTex",    2);
         pbrInstShader.set("uSSAO",        4);
         pbrInstShader.set("uSH",          5);
+        pbrInstShader.set("uSSGI",        6);
+        glActiveTexture(GL_TEXTURE6);
+        glBindTexture(GL_TEXTURE_2D, ssgiFB.color);
+        glActiveTexture(GL_TEXTURE0);
         glActiveTexture(GL_TEXTURE5);
         glBindTexture(GL_TEXTURE_2D, shFB.color);
         glActiveTexture(GL_TEXTURE0);
@@ -505,7 +592,7 @@ int main() {
         // Non-instanced geometry (floor, GLB)
         pbrModelShader.use();
         pbrModelShader.set("uViewProj",    viewProj);
-        pbrModelShader.set("uView",        view);
+        pbrModelShader.set("uPrevViewProj", prevViewProj);
         for (int i = 0; i < CSM_CASCADE_COUNT; ++i) {
             char n[32]; std::snprintf(n, 32, "uLightSpace[%d]", i);
             pbrModelShader.set(n, shadow.lightSpace[i]);
@@ -523,6 +610,7 @@ int main() {
         pbrModelShader.set("uCrateTex",    2);
         pbrModelShader.set("uSSAO",        4);
         pbrModelShader.set("uSH",          5);
+        pbrModelShader.set("uSSGI",        6);
         pbrModelShader.set("uGroundTex",   3);
         if (floorTex.id) floorTex.bind(3);
         shadow.bindForReading(1);
@@ -537,6 +625,56 @@ int main() {
         }
         fb_unbind(fbw, fbh);
 
+        // ---------- Blit current lit color into sceneFB.color ----------
+        // SSGI on the next frame reads this as its "previous frame" input.
+        {
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, gbuf.fbo);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, sceneFB.fbo);
+            GLenum b = GL_COLOR_ATTACHMENT0;
+            glDrawBuffers(1, &b);
+            glBlitFramebuffer(0, 0, gbuf.width, gbuf.height,
+                              0, 0, sceneFB.width, sceneFB.height,
+                              GL_COLOR_BUFFER_BIT, GL_LINEAR);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        }
+
+        // ---------- TAA resolve ----------
+        int curr = taaPing;
+        int prev = 1 - taaPing;
+        {
+            fb_bind(&taaHistory[curr]);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
+            glClearColor(0,0,0,1);
+            glClear(GL_COLOR_BUFFER_BIT);
+
+            pass_use(&taaPass);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, gbuf.color);
+            pass_set_i32(&taaPass, "uCurrent", 0);
+
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, taaHistory[prev].color);
+            pass_set_i32(&taaPass, "uHistory", 1);
+
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, gbuf.color1);   // albedo, prevUV.x in .a
+            pass_set_i32(&taaPass, "uGBuffer", 2);
+
+            glActiveTexture(GL_TEXTURE3);
+            glBindTexture(GL_TEXTURE_2D, gbuf.color3);   // emissive, prevUV.y in .a
+            pass_set_i32(&taaPass, "uGBuffer2", 3);
+
+            pass_set_vec2(&taaPass, "uResolution", glm::vec2(fbw, fbh));
+            pass_set_f32(&taaPass, "uBlendFactor",
+                         frameIndex == 0 ? 0.0f : 0.9f);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+
+            glEnable(GL_DEPTH_TEST);
+            glEnable(GL_CULL_FACE);
+        }
+
         // ---------- Tonemap G-buffer attachment 0 -> backbuffer ----------
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glViewport(0, 0, fbw, fbh);
@@ -547,7 +685,7 @@ int main() {
 
         pass_use(&tonemapPass);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, gbuf.color);
+        glBindTexture(GL_TEXTURE_2D, taaHistory[curr].color);
         pass_set_i32(&tonemapPass, "uScene", 0);
         pass_set_vec2(&tonemapPass, "uInvSize", glm::vec2(1.f/fbw, 1.f/fbh));
         glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -555,6 +693,9 @@ int main() {
         glEnable(GL_DEPTH_TEST);
         glEnable(GL_CULL_FACE);
 
+        taaPing = 1 - taaPing;
+        prevViewProj = viewProj;
+        frameIndex++;
         glfwSwapBuffers(win);
         glfwPollEvents();
     }
@@ -564,6 +705,7 @@ int main() {
     fb_destroy(&octaCaptureFB);
     fb_destroy(&shFB);
     if (ssaoFB.fbo)  fb_destroy(&ssaoFB);
+    if (ssgiFB.fbo)  fb_destroy(&ssgiFB);
     if (ssaoBlurFB.fbo) fb_destroy(&ssaoBlurFB);
     if (sceneFB.fbo) fb_destroy(&sceneFB);
     pass_destroy(&tonemapPass);

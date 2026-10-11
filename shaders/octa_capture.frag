@@ -36,8 +36,8 @@ vec3 trace(vec3 ro, vec3 rd, out bool hitGround) {
             vec3 N = vec3(0.0, 1.0, 0.0);
             vec3 L = normalize(-uLightDir);
             float NdotL = max(dot(N, L), 0.0);
-            vec3 diffuse = uGroundAlbedo / PI * uLightColor * uLightIntensity * NdotL;
-            vec3 ambient = uGroundAlbedo * 0.15;
+            vec3 diffuse = uGroundAlbedo * uLightColor * uLightIntensity * NdotL;
+            vec3 ambient = uGroundAlbedo * 0.4;
             radiance = diffuse + ambient;
             return radiance;
         }
@@ -45,7 +45,7 @@ vec3 trace(vec3 ro, vec3 rd, out bool hitGround) {
 
     // Sky gradient
     float up = clamp(rd.y, 0.0, 1.0);
-    radiance = mix(uSkyHorizon, uSkyZenith, pow(up, 0.55));
+    radiance = mix(uSkyHorizon, uSkyZenith, pow(up, 0.55)) * 1.5;
 
     // NOTE: no sun disk in the SH capture. The SH probe represents ambient
     // only — the directional light is evaluated separately in the main

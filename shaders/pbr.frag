@@ -6,6 +6,7 @@ in vec3 vColor;
 in float vMaterial;
 in vec4 vLightSpacePos;
 in float vViewDepth;
+in vec2 vPrevUV;
 
 uniform vec3  uCamPos;
 uniform vec3  uLightDir;
@@ -24,6 +25,7 @@ uniform vec2      uUVScale;
 
 uniform sampler2D uSSAO;
 uniform sampler2D uSH;
+uniform sampler2D uSSGI;
 
 layout(location = 0) out vec4 fragColor;
 layout(location = 1) out vec4 gAlbedo;
@@ -145,12 +147,21 @@ void main() {
     float ao = texture(uSSAO, ao_uv).r;
 
     vec3 E_ambient = sh_irradiance(N);
-    vec3 ambient = kD * albedo / PI * E_ambient * ao;
+    vec3 ambient = kD * albedo * E_ambient * ao;
+
+    // SSGI: screen-space indirect diffuse, added to the ambient.
+    // One-frame lag — reads the previous frame's SSGI output.
+    vec3 ssgi = texture(uSSGI, ao_uv).rgb;
+    ambient += kD * ssgi;
 
     vec3 color = direct + ambient;
 
     fragColor = vec4(color, 1.0);
     gAlbedo   = vec4(albedo, 1.0);
     gNormal   = vec4(N * 0.5 + 0.5, roughness);
-    gEmissive = vec4(0.0, 0.0, 0.0, 1.0);
+    // Pack prevUV into the unused alpha channels of two attachments.
+    // gAlbedo.a and gEmissive.a are both free (albedo alpha was unused,
+    // emissive alpha was a placeholder 1.0).
+    gAlbedo   = vec4(albedo, vPrevUV.x);
+    gEmissive = vec4(0.0, 0.0, 0.0, vPrevUV.y);
 }
