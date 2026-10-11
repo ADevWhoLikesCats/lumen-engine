@@ -349,9 +349,9 @@ int main() {
     if (ssaoBlurFB.fbo) fb_destroy(&ssaoBlurFB);
         sceneFB     = fb_create_with_depth_tex(w, h, FB_RGBA16F);
         gbuf        = fb_create_gbuffer(w, h, sceneFB.depth);
-        ssaoFB      = fb_create(w, h, FB_R8);
-        ssgiFB      = fb_create(w, h, FB_RGBA16F);
-        ssaoBlurFB  = fb_create(w, h, FB_R8);
+        ssaoFB      = fb_create(w/2, h/2, FB_R8);
+        ssgiFB      = fb_create(w/2, h/2, FB_RGBA16F);
+        ssaoBlurFB  = fb_create(w/2, h/2, FB_R8);
         if (taaHistory[0].fbo) fb_destroy(&taaHistory[0]);
         if (taaHistory[1].fbo) fb_destroy(&taaHistory[1]);
         taaHistory[0] = fb_create(w, h, FB_RGBA16F);
@@ -479,7 +479,7 @@ int main() {
             pass_set_mat4(&ssaoPass, "uInvViewProj", invVP);
             pass_set_mat4(&ssaoPass, "uViewProj", viewProj);
             pass_set_vec3(&ssaoPass, "uCamPos", cam.pos);
-            pass_set_vec2(&ssaoPass, "uResolution", glm::vec2(fbw, fbh));
+            pass_set_vec2(&ssaoPass, "uResolution", glm::vec2(fbw/2, fbh/2));
             pass_set_f32(&ssaoPass, "uRadius", 0.5f);
             pass_set_f32(&ssaoPass, "uBias", 0.02f);
             pass_set_f32(&ssaoPass, "uIntensity", 1.0f);
@@ -491,7 +491,7 @@ int main() {
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, ssaoFB.color);
             pass_set_i32(&ssaoBlurPass, "uSSAO", 0);
-            pass_set_vec2(&ssaoBlurPass, "uInvResolution", glm::vec2(1.f/fbw, 1.f/fbh));
+            pass_set_vec2(&ssaoBlurPass, "uInvResolution", glm::vec2(2.f/fbw, 2.f/fbh));
             glDrawArrays(GL_TRIANGLES, 0, 3);
 
             glEnable(GL_DEPTH_TEST);
@@ -533,7 +533,7 @@ int main() {
             pass_set_mat4(&ssgiPass, "uInvViewProj", invVP);
             pass_set_mat4(&ssgiPass, "uViewProj", viewProj);
             pass_set_vec3(&ssgiPass, "uCamPos", cam.pos);
-            pass_set_vec2(&ssgiPass, "uResolution", glm::vec2(fbw, fbh));
+            pass_set_vec2(&ssgiPass, "uResolution", glm::vec2(fbw/2, fbh/2));
             glDrawArrays(GL_TRIANGLES, 0, 3);
 
             glEnable(GL_DEPTH_TEST);

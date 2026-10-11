@@ -9,15 +9,17 @@ uniform float uBlendFactor;     // 0.9 typical
 out vec4 fragColor;
 
 vec3 clip_to_neighborhood(vec3 history, vec2 uv, vec2 texel) {
-    vec3 cmin = vec3(1e30);
-    vec3 cmax = vec3(-1e30);
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            vec3 c = texture(uCurrent, uv + vec2(float(dx), float(dy)) * texel).rgb;
-            cmin = min(cmin, c);
-            cmax = max(cmax, c);
-        }
-    }
+    // 5-tap cross instead of 3x3 — cuts texture reads nearly in half with
+    // almost no quality difference for TAA clamping.
+    vec3 c0 = texture(uCurrent, uv).rgb;
+    vec3 c1 = texture(uCurrent, uv + vec2( 1, 0) * texel).rgb;
+    vec3 c2 = texture(uCurrent, uv + vec2(-1, 0) * texel).rgb;
+    vec3 c3 = texture(uCurrent, uv + vec2( 0, 1) * texel).rgb;
+    vec3 c4 = texture(uCurrent, uv + vec2( 0,-1) * texel).rgb;
+
+    vec3 cmin = min(min(c0, min(c1, c2)), min(c3, c4));
+    vec3 cmax = max(max(c0, max(c1, c2)), max(c3, c4));
+
     vec3 range = (cmax - cmin) * 1.5;
     vec3 mid = (cmax + cmin) * 0.5;
     return clamp(history, mid - range * 0.5, mid + range * 0.5);
